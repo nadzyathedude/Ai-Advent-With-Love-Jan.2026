@@ -21,3 +21,4 @@ config.py
 
 # OS
 .DS_Store
+*.db
