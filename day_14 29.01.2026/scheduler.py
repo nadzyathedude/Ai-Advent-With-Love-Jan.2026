@@ -15,7 +15,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Callable, Optional, Awaitable, Union
+from typing import Callable, Optional, Awaitable, Union, Dict
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -146,6 +146,88 @@ class ReminderScheduler:
         except Exception as e:
             logger.error(f"Error sending reminder to user {user_id}: {e}", exc_info=True)
 
+    async def check_task_reminders(self) -> None:
+        """
+        Check for task-specific reminders that are due and send them.
+
+        This is called every minute by the scheduler.
+        """
+        now = datetime.now()
+        current_time_iso = now.strftime("%Y-%m-%dT%H:%M:%S")
+
+        logger.debug(f"Checking task reminders at {current_time_iso}")
+
+        try:
+            mcp = self._get_mcp_client()
+
+            # Get due task reminders
+            if self._use_http:
+                # HTTP client would need a new method
+                return  # Not implemented for HTTP mode yet
+            else:
+                result = await mcp.call_tool("task_reminder_get_due", {
+                    "current_time": current_time_iso
+                })
+
+            if not result.success:
+                logger.error(f"Failed to get due task reminders: {result.error}")
+                return
+
+            reminders = result.data.get("reminders", [])
+
+            if not reminders:
+                return
+
+            logger.info(f"Found {len(reminders)} due task reminders")
+
+            # Send each reminder
+            for reminder in reminders:
+                await self._send_task_reminder(reminder)
+
+        except Exception as e:
+            logger.error(f"Error in task reminder check: {e}", exc_info=True)
+
+    async def _send_task_reminder(self, reminder: Dict) -> None:
+        """
+        Send a task-specific reminder notification.
+
+        Args:
+            reminder: Reminder dict with task info
+        """
+        try:
+            user_id = reminder["user_id"]
+            task_id = reminder["task_id"]
+            task_title = reminder.get("task_title", "Task")
+            custom_message = reminder.get("message")
+            reminder_id = reminder["id"]
+
+            # Build reminder message
+            message_lines = [
+                f"Reminder: {task_title}",
+                f"(Task ID: {task_id})"
+            ]
+            if custom_message:
+                message_lines.append(f"\n{custom_message}")
+
+            message = "\n".join(message_lines)
+
+            # Send via Telegram
+            success = await self.send_message(user_id, message)
+
+            if success:
+                # Mark reminder as sent
+                mcp = self._get_mcp_client()
+                if not self._use_http:
+                    await mcp.call_tool("task_reminder_mark_sent", {
+                        "reminder_id": reminder_id
+                    })
+                logger.info(f"Task reminder {reminder_id} sent to user {user_id}")
+            else:
+                logger.error(f"Failed to send task reminder {reminder_id} to user {user_id}")
+
+        except Exception as e:
+            logger.error(f"Error sending task reminder: {e}", exc_info=True)
+
     async def send_immediate_reminder(self, user_id: str) -> tuple[bool, str]:
         """
         Send an immediate reminder to a user.
@@ -184,18 +266,27 @@ class ReminderScheduler:
             logger.warning("Scheduler already running")
             return
 
-        # Schedule the reminder check to run every minute
+        # Schedule the daily reminder check to run every minute
         self.scheduler.add_job(
             self.check_and_send_reminders,
             CronTrigger(minute="*"),  # Every minute
             id="reminder_check",
-            name="Check and send reminders",
+            name="Check and send daily reminders",
+            replace_existing=True
+        )
+
+        # Schedule task-specific reminder check to run every minute
+        self.scheduler.add_job(
+            self.check_task_reminders,
+            CronTrigger(minute="*"),  # Every minute
+            id="task_reminder_check",
+            name="Check and send task reminders",
             replace_existing=True
         )
 
         self.scheduler.start()
         self._running = True
-        logger.info("Reminder scheduler started")
+        logger.info("Reminder scheduler started (daily + task reminders)")
 
     def stop(self) -> None:
         """Stop the scheduler."""

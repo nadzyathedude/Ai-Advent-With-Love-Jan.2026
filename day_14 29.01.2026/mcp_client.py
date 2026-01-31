@@ -34,6 +34,14 @@ class MCPToolsResult:
     cached: bool = False
 
 
+@dataclass
+class MCPCallResult:
+    """Result of calling an MCP tool."""
+    success: bool
+    data: Optional[dict] = None
+    error: Optional[str] = None
+
+
 class PerplexityMCPClient:
     """
     Client for connecting to the Perplexity MCP Server.
@@ -144,6 +152,70 @@ class PerplexityMCPClient:
 
                 return tools
 
+    async def call_tool(self, tool_name: str, arguments: dict) -> MCPCallResult:
+        """
+        Call an MCP tool on the Perplexity server.
+
+        Args:
+            tool_name: Name of the tool to call
+            arguments: Tool arguments
+
+        Returns:
+            MCPCallResult with the result or error
+        """
+        server_params = StdioServerParameters(
+            command="npx",
+            args=["-yq", "@perplexity-ai/mcp-server"],
+            env={
+                **os.environ,
+                "PERPLEXITY_API_KEY": self.api_key
+            }
+        )
+
+        logger.info(f"Calling Perplexity MCP tool: {tool_name}")
+
+        try:
+            async with stdio_client(server_params) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+
+                    result = await session.call_tool(tool_name, arguments)
+
+                    # Parse the result
+                    if result.content and len(result.content) > 0:
+                        text_content = result.content[0]
+                        if hasattr(text_content, 'text'):
+                            return MCPCallResult(
+                                success=True,
+                                data={"text": text_content.text}
+                            )
+
+                    return MCPCallResult(
+                        success=False,
+                        error="Empty response from Perplexity server"
+                    )
+
+        except Exception as e:
+            error_msg = f"Failed to call Perplexity tool: {e}"
+            logger.error(error_msg, exc_info=True)
+            return MCPCallResult(success=False, error=error_msg)
+
+    async def ask_perplexity(self, query: str) -> MCPCallResult:
+        """
+        Ask Perplexity a question using the perplexity_ask tool.
+
+        Args:
+            query: The question to ask
+
+        Returns:
+            MCPCallResult with the response or error
+        """
+        # Perplexity MCP server expects a messages array
+        messages = [
+            {"role": "user", "content": query}
+        ]
+        return await self.call_tool("perplexity_ask", {"messages": messages})
+
 
 # Global client instance (initialized lazily)
 _mcp_client: Optional[PerplexityMCPClient] = None
@@ -217,3 +289,22 @@ def format_tools_for_telegram(result: MCPToolsResult) -> str:
         lines.append("\n_Cached result_")
 
     return "\n".join(lines)
+
+
+async def ask_perplexity(query: str) -> MCPCallResult:
+    """
+    Convenience function to ask Perplexity a question.
+
+    Args:
+        query: The question to ask
+
+    Returns:
+        MCPCallResult with response or error
+    """
+    client = get_mcp_client()
+    if client is None:
+        return MCPCallResult(
+            success=False,
+            error="MCP client not initialized. Please configure PERPLEXITY_API_KEY."
+        )
+    return await client.ask_perplexity(query)

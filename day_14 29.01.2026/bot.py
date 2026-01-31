@@ -1,5 +1,8 @@
+import asyncio
 import logging
 import os
+import re
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -14,6 +17,13 @@ from telegram.constants import ChatAction
 from openai import OpenAI
 
 from config import api_token_telegram, api_token_openai, api_token_perplexity
+
+# Optional Yandex Calendar credentials
+try:
+    from config import yandex_calendar_username, yandex_calendar_password
+except ImportError:
+    yandex_calendar_username = ""
+    yandex_calendar_password = ""
 
 # Environment configuration for Kubernetes
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8080")
@@ -37,7 +47,7 @@ from conversation_store import init_conversation_store, get_conversation_store
 from external_memory import init_external_memory, get_external_memory
 from memory_retrieval import init_memory_retrieval, get_memory_retrieval
 from summary_manager import SummaryManager
-from mcp_client import init_mcp_client, get_mcp_tools, format_tools_for_telegram
+from mcp_client import init_mcp_client, get_mcp_tools, format_tools_for_telegram, ask_perplexity
 from task_tracker_client import (
     init_task_tracker_client,
     get_task_tracker_client,
@@ -51,6 +61,12 @@ from mcp_http_client import (
     close_mcp_http_client,
 )
 from scheduler import init_scheduler, start_scheduler, stop_scheduler, get_scheduler
+from yandex_calendar import (
+    init_yandex_calendar,
+    is_calendar_enabled,
+    add_task_to_calendar,
+    delete_task_from_calendar,
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -79,6 +95,20 @@ STORAGE_CALLBACK_PREFIX = "storage_type:"
     WAITING_FOR_STORAGE_TYPE,
     WAITING_FOR_THRESHOLD,
 ) = range(2)
+
+# Conversation states for /task_add flow
+(
+    WAITING_FOR_SUBLIST_DECISION,
+    WAITING_FOR_REMINDER_DECISION,
+    WAITING_FOR_CUSTOM_REMINDER_TIME,
+    WAITING_FOR_CALENDAR_DECISION,
+    WAITING_FOR_CALENDAR_DATETIME,
+) = range(10, 15)
+
+# Callback data prefixes for task creation flow
+SUBLIST_CALLBACK_PREFIX = "sublist:"
+REMINDER_CALLBACK_PREFIX = "task_reminder:"
+CALENDAR_CALLBACK_PREFIX = "calendar:"
 
 # Системный промпт для GPT
 SYSTEM_PROMPT = """Ты — умный и дружелюбный ассистент в Telegram.
@@ -140,7 +170,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /help — эта справка
 /set\\_model — выбрать модель ИИ
 /tokens — управление отчётом о токенах
-/tasks — количество открытых задач
+/task\\_add — добавить задачу (+ AI sublist)
+/task\\_remind — напомнить о задаче
 /reminder — управление напоминаниями
 /show\\_commands — список всех команд
 
@@ -162,9 +193,10 @@ async def show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 **Задачи (MCP):**
 /tasks — Количество открытых задач
-/task\\_add — Добавить задачу
+/task\\_add — Добавить задачу (+ sublist + reminder)
 /task\\_list — Список задач
 /task\\_done — Завершить задачу
+/task\\_remind — Напомнить о задаче
 /task\\_tools — MCP инструменты
 
 **Напоминания:**
@@ -762,9 +794,11 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
-async def task_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def task_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Обработчик команды /task_add - добавляет новую задачу.
+
+    Enhanced version: After creating the task, asks about sublist and reminder.
 
     Usage: /task_add <title> [| description]
     """
@@ -777,7 +811,7 @@ async def task_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Usage: `/task_add <title>` or `/task_add <title> | <description>`",
             parse_mode="Markdown"
         )
-        return
+        return ConversationHandler.END
 
     # Join all arguments
     full_text = " ".join(context.args)
@@ -796,7 +830,7 @@ async def task_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Task title cannot be empty.",
             parse_mode="Markdown"
         )
-        return
+        return ConversationHandler.END
 
     # Show typing indicator
     await context.bot.send_chat_action(
@@ -811,7 +845,7 @@ async def task_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 "Task Tracker not initialized.",
                 parse_mode="Markdown"
             )
-            return
+            return ConversationHandler.END
 
         # Call MCP tool to create task
         result = await client.create_task(
@@ -822,19 +856,39 @@ async def task_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         if result.success and result.data:
             task_id = result.data.get("task_id", "?")
+
+            # Store task info for later use in conversation
+            context.user_data["pending_task_id"] = task_id
+            context.user_data["pending_task_title"] = title
+            context.user_data["pending_task_description"] = description
+
             await update.message.reply_text(
-                f"Task created!\n\n"
-                f"**ID:** {task_id}\n"
-                f"**Title:** {title}\n"
-                + (f"**Description:** {description}\n" if description else ""),
+                f"Task created: **{title}**"
+                + (f"\n_{description}_" if description else ""),
                 parse_mode="Markdown"
             )
             logger.info(f"User {user.id} created task {task_id}: {title}")
+
+            # Ask about sublist generation
+            keyboard = [
+                [
+                    InlineKeyboardButton("Yes", callback_data=f"{SUBLIST_CALLBACK_PREFIX}yes"),
+                    InlineKeyboardButton("No", callback_data=f"{SUBLIST_CALLBACK_PREFIX}no"),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                "Would you like me to generate a to-do sublist for this task?",
+                reply_markup=reply_markup
+            )
+            return WAITING_FOR_SUBLIST_DECISION
         else:
             await update.message.reply_text(
                 f"*Error:* {result.error}",
                 parse_mode="Markdown"
             )
+            return ConversationHandler.END
 
     except Exception as e:
         logger.error(f"Error creating task for user {user.id}: {e}", exc_info=True)
@@ -842,6 +896,496 @@ async def task_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"*Error:* Failed to create task.\n{e}",
             parse_mode="Markdown"
         )
+        return ConversationHandler.END
+
+
+async def sublist_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the sublist generation decision."""
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    callback_data = query.data
+
+    if not callback_data.startswith(SUBLIST_CALLBACK_PREFIX):
+        return WAITING_FOR_SUBLIST_DECISION
+
+    decision = callback_data[len(SUBLIST_CALLBACK_PREFIX):]
+    task_id = context.user_data.get("pending_task_id")
+    task_title = context.user_data.get("pending_task_title", "Task")
+
+    if decision == "yes":
+        await query.edit_message_text("Generating sublist with Perplexity AI...")
+
+        try:
+            # Call Perplexity to generate sublist
+            prompt = f"Generate a short to-do checklist (3-5 items) for this task: '{task_title}'. Format as a simple bullet list with - prefix. No markdown, plain text only."
+            result = await ask_perplexity(prompt)
+
+            if result.success and result.data:
+                sublist_text = result.data.get("text", "")
+
+                # Update task description with the sublist
+                client = get_task_tracker_client()
+                if client and task_id:
+                    await client.update_task_description(
+                        user_id=str(user.id),
+                        task_id=task_id,
+                        description=f"Sublist:\n{sublist_text}"
+                    )
+
+                # Send without Markdown to avoid parsing errors
+                await query.edit_message_text(
+                    f"Sublist generated and added to task:\n\n{sublist_text}"
+                )
+                logger.info(f"User {user.id} generated sublist for task {task_id}")
+            else:
+                await query.edit_message_text(
+                    f"Could not generate sublist: {result.error}\n"
+                    "Continuing without sublist."
+                )
+
+        except Exception as e:
+            logger.error(f"Error generating sublist: {e}", exc_info=True)
+            await query.edit_message_text(
+                f"Error generating sublist: {e}\nContinuing without sublist."
+            )
+    else:
+        await query.edit_message_text("Skipping sublist generation.")
+
+    # Now ask about reminder
+    return await _ask_reminder_decision(update, context)
+
+
+async def _ask_reminder_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask about setting a reminder for the task."""
+    keyboard = [
+        [
+            InlineKeyboardButton("1h", callback_data=f"{REMINDER_CALLBACK_PREFIX}1h"),
+            InlineKeyboardButton("3h", callback_data=f"{REMINDER_CALLBACK_PREFIX}3h"),
+            InlineKeyboardButton("Tomorrow 9:00", callback_data=f"{REMINDER_CALLBACK_PREFIX}tomorrow"),
+        ],
+        [
+            InlineKeyboardButton("Custom time", callback_data=f"{REMINDER_CALLBACK_PREFIX}custom"),
+            InlineKeyboardButton("No reminder", callback_data=f"{REMINDER_CALLBACK_PREFIX}none"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Get the message to reply to
+    if update.callback_query:
+        await update.callback_query.message.reply_text(
+            "When should I remind you about this task?",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            "When should I remind you about this task?",
+            reply_markup=reply_markup
+        )
+
+    return WAITING_FOR_REMINDER_DECISION
+
+
+async def reminder_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the reminder time decision."""
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    callback_data = query.data
+
+    if not callback_data.startswith(REMINDER_CALLBACK_PREFIX):
+        return WAITING_FOR_REMINDER_DECISION
+
+    decision = callback_data[len(REMINDER_CALLBACK_PREFIX):]
+    task_id = context.user_data.get("pending_task_id")
+    task_title = context.user_data.get("pending_task_title", "Task")
+
+    if decision == "none":
+        await query.edit_message_text("No reminder set.")
+        # Ask about Yandex Calendar
+        return await _ask_calendar_decision(update, context)
+
+    if decision == "custom":
+        await query.edit_message_text(
+            "Enter reminder time. Supported formats:\n"
+            "• `in 2 hours` / `in 30 minutes`\n"
+            "• `tomorrow 9:00`\n"
+            "• `14:30` (today or tomorrow)\n"
+            "• `2026-02-01 10:00`\n\n"
+            "Or /cancel to skip.",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_CUSTOM_REMINDER_TIME
+
+    # Calculate reminder time based on decision
+    now = datetime.now()
+
+    if decision == "1h":
+        reminder_time = now + timedelta(hours=1)
+    elif decision == "3h":
+        reminder_time = now + timedelta(hours=3)
+    elif decision == "tomorrow":
+        # Tomorrow at 9:00
+        reminder_time = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    else:
+        await query.edit_message_text("Unknown option. No reminder set.")
+        _clear_pending_task(context)
+        return ConversationHandler.END
+
+    # Create the reminder
+    success = await _create_task_reminder(user.id, task_id, reminder_time, context)
+
+    if success:
+        time_str = reminder_time.strftime("%Y-%m-%d %H:%M")
+        message = f"Reminder set for **{time_str}**!"
+    else:
+        message = "Failed to set reminder."
+
+    await query.edit_message_text(message, parse_mode="Markdown")
+
+    # Ask about Yandex Calendar
+    return await _ask_calendar_decision(update, context)
+
+
+async def custom_reminder_time_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parse custom reminder time input."""
+    user = update.effective_user
+    text = update.message.text.strip()
+
+    task_id = context.user_data.get("pending_task_id")
+    task_title = context.user_data.get("pending_task_title", "Task")
+
+    # Parse the time
+    reminder_time = parse_reminder_time(text)
+
+    if reminder_time is None:
+        await update.message.reply_text(
+            "Could not parse time. Please try again or /cancel.\n\n"
+            "Examples: `in 2 hours`, `tomorrow 9:00`, `14:30`, `2026-02-01 10:00`",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_CUSTOM_REMINDER_TIME
+
+    # Create the reminder
+    success = await _create_task_reminder(user.id, task_id, reminder_time, context)
+
+    time_str = reminder_time.strftime("%Y-%m-%d %H:%M")
+    if success:
+        message = f"Reminder set for **{time_str}**!"
+    else:
+        message = "Failed to set reminder."
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+    # Ask about Yandex Calendar
+    return await _ask_calendar_decision(update, context)
+
+
+def parse_reminder_time(text: str) -> datetime | None:
+    """
+    Parse reminder time from various formats.
+
+    Supported formats:
+    - "in X hours" / "in X minutes"
+    - "tomorrow HH:MM"
+    - "HH:MM" (today or tomorrow if past)
+    - "YYYY-MM-DD HH:MM"
+
+    Returns:
+        datetime object or None if parsing failed
+    """
+    text = text.lower().strip()
+    now = datetime.now()
+
+    # Pattern: "in X hours" or "in X minutes"
+    match = re.match(r'in\s+(\d+)\s*(hours?|h|minutes?|min|m)', text)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2)
+        if unit.startswith('h'):
+            return now + timedelta(hours=amount)
+        else:
+            return now + timedelta(minutes=amount)
+
+    # Pattern: "today HH:MM"
+    match = re.match(r'today\s+(\d{1,2}):(\d{2})', text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    # Pattern: "tomorrow HH:MM"
+    match = re.match(r'tomorrow\s+(\d{1,2}):(\d{2})', text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        tomorrow = now + timedelta(days=1)
+        return tomorrow.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    # Pattern: "HH:MM" (today or tomorrow if past)
+    match = re.match(r'^(\d{1,2}):(\d{2})$', text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            result = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # If time is in the past, schedule for tomorrow
+            if result <= now:
+                result = result + timedelta(days=1)
+            return result
+
+    # Pattern: "YYYY-MM-DD HH:MM"
+    match = re.match(r'(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', text)
+    if match:
+        try:
+            return datetime(
+                year=int(match.group(1)),
+                month=int(match.group(2)),
+                day=int(match.group(3)),
+                hour=int(match.group(4)),
+                minute=int(match.group(5))
+            )
+        except ValueError:
+            return None
+
+    return None
+
+
+async def _create_task_reminder(user_id: int, task_id: int,
+                                 reminder_time: datetime,
+                                 context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Create a task reminder via MCP."""
+    try:
+        client = get_task_tracker_client()
+        if client is None:
+            return False
+
+        reminder_time_iso = reminder_time.strftime("%Y-%m-%dT%H:%M:%S")
+        result = await client.create_task_reminder(
+            task_id=task_id,
+            user_id=str(user_id),
+            reminder_time=reminder_time_iso
+        )
+
+        if result.success:
+            logger.info(f"Created reminder for task {task_id} at {reminder_time_iso}")
+            return True
+        else:
+            logger.error(f"Failed to create reminder: {result.error}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error creating task reminder: {e}", exc_info=True)
+        return False
+
+
+async def _add_to_yandex_calendar(task_title: str,
+                                   task_description: str | None,
+                                   reminder_time: datetime | None) -> str:
+    """
+    Add task to Yandex Calendar if enabled.
+
+    Returns:
+        Status message for the user
+    """
+    if not is_calendar_enabled():
+        return ""
+
+    try:
+        result = await add_task_to_calendar(task_title, task_description, reminder_time)
+
+        if result.success:
+            logger.info(f"Added task to Yandex Calendar: {task_title}")
+            return "\nAdded to Yandex Calendar"
+        else:
+            logger.warning(f"Failed to add to calendar: {result.error}")
+            return ""
+
+    except Exception as e:
+        logger.error(f"Error adding to Yandex Calendar: {e}", exc_info=True)
+        return ""
+
+
+def _clear_pending_task(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear pending task data from context."""
+    context.user_data.pop("pending_task_id", None)
+    context.user_data.pop("pending_task_title", None)
+    context.user_data.pop("pending_task_description", None)
+
+
+async def _ask_calendar_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask if user wants to add task to Yandex Calendar."""
+    if not is_calendar_enabled():
+        # Calendar not configured, skip this step
+        if update.callback_query:
+            await update.callback_query.message.reply_text("Task setup complete!")
+        else:
+            await update.message.reply_text("Task setup complete!")
+        _clear_pending_task(context)
+        return ConversationHandler.END
+
+    keyboard = [
+        [
+            InlineKeyboardButton("Yes", callback_data=f"{CALENDAR_CALLBACK_PREFIX}yes"),
+            InlineKeyboardButton("No", callback_data=f"{CALENDAR_CALLBACK_PREFIX}no"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message_text = "Would you like to add this task to Yandex Calendar?"
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(message_text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(message_text, reply_markup=reply_markup)
+
+    return WAITING_FOR_CALENDAR_DECISION
+
+
+async def calendar_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the calendar decision (Yes/No)."""
+    query = update.callback_query
+    await query.answer()
+
+    callback_data = query.data
+
+    if not callback_data.startswith(CALENDAR_CALLBACK_PREFIX):
+        return WAITING_FOR_CALENDAR_DECISION
+
+    decision = callback_data[len(CALENDAR_CALLBACK_PREFIX):]
+
+    if decision == "no":
+        await query.edit_message_text("Task setup complete!")
+        _clear_pending_task(context)
+        return ConversationHandler.END
+
+    # User wants to add to calendar - ask for date/time
+    await query.edit_message_text(
+        "Enter date and time for the calendar event.\n\n"
+        "Supported formats:\n"
+        "• `today 14:30` — today at 14:30\n"
+        "• `tomorrow 9:00` — tomorrow at 9:00\n"
+        "• `2026-02-01 10:00` — specific date and time\n"
+        "• `14:30` — today (or tomorrow if past)\n\n"
+        "Or /cancel to skip.",
+        parse_mode="Markdown"
+    )
+    return WAITING_FOR_CALENDAR_DATETIME
+
+
+async def calendar_datetime_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parse calendar date/time input and add to Yandex Calendar."""
+    text = update.message.text.strip()
+    task_title = context.user_data.get("pending_task_title", "Task")
+    task_description = context.user_data.get("pending_task_description")
+
+    # Parse the time
+    calendar_time = parse_reminder_time(text)
+
+    if calendar_time is None:
+        await update.message.reply_text(
+            "Could not parse date/time. Please try again or /cancel.\n\n"
+            "Examples: `today 14:30`, `tomorrow 9:00`, `2026-02-01 10:00`",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_CALENDAR_DATETIME
+
+    # Add to Yandex Calendar
+    calendar_message = await _add_to_yandex_calendar(task_title, task_description, calendar_time)
+
+    time_str = calendar_time.strftime("%Y-%m-%d %H:%M")
+    if calendar_message:
+        message = f"Added to Yandex Calendar for **{time_str}**!\nTask setup complete!"
+    else:
+        message = f"Failed to add to calendar.\nTask setup complete!"
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+    _clear_pending_task(context)
+    return ConversationHandler.END
+
+
+async def task_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the task add conversation."""
+    _clear_pending_task(context)
+    await update.message.reply_text("Task setup cancelled.")
+    return ConversationHandler.END
+
+
+async def task_remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Set a reminder for an existing task.
+
+    Usage: /task_remind <task_id> <time>
+    Example: /task_remind 5 in 2 hours
+    """
+    user = update.effective_user
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/task_remind <task_id> <time>`\n\n"
+            "Examples:\n"
+            "• `/task_remind 5 in 2 hours`\n"
+            "• `/task_remind 3 tomorrow 9:00`\n"
+            "• `/task_remind 1 14:30`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Task ID must be a number.")
+        return
+
+    # Rest of args form the time
+    time_text = " ".join(context.args[1:])
+    reminder_time = parse_reminder_time(time_text)
+
+    if reminder_time is None:
+        await update.message.reply_text(
+            f"Could not parse time: `{time_text}`\n\n"
+            "Try formats like: `in 2 hours`, `tomorrow 9:00`, `14:30`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Verify task exists
+    client = get_task_tracker_client()
+    if client is None:
+        await update.message.reply_text("Task Tracker not initialized.")
+        return
+
+    task_result = await client.get_task(user_id=str(user.id), task_id=task_id)
+    if not task_result.success:
+        await update.message.reply_text(f"Task {task_id} not found.")
+        return
+
+    task_title = task_result.data.get("task", {}).get("title", "Task")
+
+    # Create reminder
+    reminder_time_iso = reminder_time.strftime("%Y-%m-%dT%H:%M:%S")
+    result = await client.create_task_reminder(
+        task_id=task_id,
+        user_id=str(user.id),
+        reminder_time=reminder_time_iso
+    )
+
+    if result.success:
+        time_str = reminder_time.strftime("%Y-%m-%d %H:%M")
+        message = f"Reminder set for **{time_str}**!\nTask: {task_title} (ID: {task_id})"
+
+        # Add to Yandex Calendar
+        calendar_message = await _add_to_yandex_calendar(task_title, None, reminder_time)
+        message += calendar_message
+
+        await update.message.reply_text(message, parse_mode="Markdown")
+        logger.info(f"User {user.id} set reminder for task {task_id} at {time_str}")
+    else:
+        await update.message.reply_text(f"Failed to set reminder: {result.error}")
 
 
 async def task_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -871,16 +1415,13 @@ async def task_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # Call MCP tool to list open tasks
         result = await client.list_open_tasks(user_id=str(user.id))
 
-        # Format and send response
+        # Format and send response (plain text to avoid Markdown parsing issues)
         response_text = format_tasks_for_telegram(result)
-        await update.message.reply_text(response_text, parse_mode="Markdown")
+        await update.message.reply_text(response_text)
 
     except Exception as e:
         logger.error(f"Error listing tasks for user {user.id}: {e}", exc_info=True)
-        await update.message.reply_text(
-            f"*Error:* Failed to list tasks.\n{e}",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"Error: Failed to list tasks.\n{e}")
 
 
 async def task_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -926,14 +1467,37 @@ async def task_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return
 
+        # Get task title first (for calendar deletion)
+        task_title = None
+        task_info = await client.get_task(user_id=str(user.id), task_id=task_id)
+        if task_info.success and task_info.data:
+            task_data = task_info.data.get("task", {})
+            task_title = task_data.get("title")
+
         # Call MCP tool to complete task
         result = await client.complete_task(user_id=str(user.id), task_id=task_id)
 
         if result.success and result.data:
-            await update.message.reply_text(
-                f"Task **{task_id}** marked as completed!",
-                parse_mode="Markdown"
-            )
+            message = f"Task completed: **{task_title or task_id}**"
+
+            # Delete from Yandex Calendar if enabled (with timeout)
+            if is_calendar_enabled() and task_title:
+                try:
+                    calendar_result = await asyncio.wait_for(
+                        delete_task_from_calendar(task_title),
+                        timeout=10.0
+                    )
+                    if calendar_result.success:
+                        message += "\nRemoved from Yandex Calendar"
+                        logger.info(f"Deleted task from calendar: {task_title}")
+                    else:
+                        logger.warning(f"Calendar delete failed: {calendar_result.error}")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Calendar delete timed out for: {task_title}")
+                except Exception as cal_err:
+                    logger.warning(f"Calendar delete error: {cal_err}")
+
+            await update.message.reply_text(message, parse_mode="Markdown")
             logger.info(f"User {user.id} completed task {task_id}")
         else:
             await update.message.reply_text(
@@ -1408,6 +1972,15 @@ def main() -> None:
         init_task_tracker_client()
         logger.info("Task Tracker MCP client (stdio) initialized")
 
+    # Инициализируем Yandex Calendar (опционально)
+    if yandex_calendar_username and yandex_calendar_password:
+        if init_yandex_calendar(yandex_calendar_username, yandex_calendar_password):
+            logger.info("Yandex Calendar integration enabled")
+        else:
+            logger.warning("Yandex Calendar initialization failed")
+    else:
+        logger.info("Yandex Calendar not configured (optional)")
+
     # Создаём приложение
     application = Application.builder().token(api_token_telegram).build()
     telegram_app = application
@@ -1453,6 +2026,7 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", summary_cancel)],
+        per_message=False,
     )
     application.add_handler(summary_conv_handler)
 
@@ -1468,10 +2042,45 @@ def main() -> None:
 
     # Обработчики команд Task Tracker (MCP)
     application.add_handler(CommandHandler("tasks", tasks_command))
-    application.add_handler(CommandHandler("task_add", task_add_command))
+
+    # Enhanced task_add with conversation flow for sublist + reminder + calendar
+    task_add_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("task_add", task_add_command)],
+        states={
+            WAITING_FOR_SUBLIST_DECISION: [
+                CallbackQueryHandler(
+                    sublist_decision_callback,
+                    pattern=f"^{SUBLIST_CALLBACK_PREFIX}"
+                )
+            ],
+            WAITING_FOR_REMINDER_DECISION: [
+                CallbackQueryHandler(
+                    reminder_decision_callback,
+                    pattern=f"^{REMINDER_CALLBACK_PREFIX}"
+                )
+            ],
+            WAITING_FOR_CUSTOM_REMINDER_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, custom_reminder_time_received)
+            ],
+            WAITING_FOR_CALENDAR_DECISION: [
+                CallbackQueryHandler(
+                    calendar_decision_callback,
+                    pattern=f"^{CALENDAR_CALLBACK_PREFIX}"
+                )
+            ],
+            WAITING_FOR_CALENDAR_DATETIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, calendar_datetime_received)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", task_add_cancel)],
+        per_message=False,
+    )
+    application.add_handler(task_add_conv_handler)
+
     application.add_handler(CommandHandler("task_list", task_list_command))
     application.add_handler(CommandHandler("task_done", task_done_command))
     application.add_handler(CommandHandler("task_tools", task_tools_command))
+    application.add_handler(CommandHandler("task_remind", task_remind_command))
 
     # Обработчик команды напоминаний
     application.add_handler(CommandHandler("reminder", reminder_command))

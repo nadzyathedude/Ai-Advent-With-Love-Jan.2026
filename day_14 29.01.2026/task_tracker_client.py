@@ -214,6 +214,62 @@ class TaskTrackerMCPClient:
         """
         return await self.call_tool("task_complete", {"user_id": user_id, "task_id": task_id})
 
+    async def get_task(self, user_id: str, task_id: int) -> TaskTrackerResult:
+        """
+        Get a task by ID.
+
+        Args:
+            user_id: User identifier
+            task_id: Task ID
+
+        Returns:
+            TaskTrackerResult with task info
+        """
+        return await self.call_tool("task_get", {"user_id": user_id, "task_id": task_id})
+
+    async def update_task_description(self, user_id: str, task_id: int,
+                                       description: str) -> TaskTrackerResult:
+        """
+        Update a task's description.
+
+        Args:
+            user_id: User identifier
+            task_id: Task ID
+            description: New description
+
+        Returns:
+            TaskTrackerResult with result
+        """
+        return await self.call_tool("task_update_description", {
+            "user_id": user_id,
+            "task_id": task_id,
+            "description": description
+        })
+
+    async def create_task_reminder(self, task_id: int, user_id: str,
+                                    reminder_time: str,
+                                    message: Optional[str] = None) -> TaskTrackerResult:
+        """
+        Create a reminder for a task.
+
+        Args:
+            task_id: Task ID
+            user_id: User identifier
+            reminder_time: ISO format datetime string
+            message: Optional custom message
+
+        Returns:
+            TaskTrackerResult with reminder info
+        """
+        args = {
+            "task_id": task_id,
+            "user_id": user_id,
+            "reminder_time": reminder_time
+        }
+        if message:
+            args["message"] = message
+        return await self.call_tool("task_reminder_create", args)
+
 
 # Global client instance
 _task_tracker_client: Optional[TaskTrackerMCPClient] = None
@@ -257,6 +313,23 @@ async def get_task_tracker_tools() -> list[TaskTrackerTool]:
     return await client.list_tools()
 
 
+def escape_markdown(text: str) -> str:
+    """
+    Escape special Markdown characters for Telegram.
+
+    Args:
+        text: Text to escape
+
+    Returns:
+        Escaped text safe for Telegram Markdown
+    """
+    # Characters that need escaping in Telegram Markdown
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in special_chars:
+        text = text.replace(char, f'\\{char}')
+    return text
+
+
 def format_tasks_for_telegram(result: TaskTrackerResult) -> str:
     """
     Format task list result for Telegram message.
@@ -265,10 +338,10 @@ def format_tasks_for_telegram(result: TaskTrackerResult) -> str:
         result: TaskTrackerResult from list_open_tasks()
 
     Returns:
-        Formatted string for Telegram (Markdown)
+        Formatted string for Telegram (plain text to avoid parsing issues)
     """
     if not result.success:
-        return f"*Error:* {result.error}"
+        return f"Error: {result.error}"
 
     if not result.data:
         return "No data received from server."
@@ -277,25 +350,23 @@ def format_tasks_for_telegram(result: TaskTrackerResult) -> str:
     count = result.data.get("count", len(tasks))
 
     if count == 0:
-        return "No open tasks found. Use `/task_add <title>` to create one."
+        return "No open tasks found. Use /task_add <title> to create one."
 
-    lines = [f"*Open Tasks ({count}):*\n"]
+    lines = [f"Open Tasks ({count}):\n"]
 
     for task in tasks:
         task_id = task.get("id", "?")
         title = task.get("title", "Untitled")
         description = task.get("description")
 
-        # Escape underscores for Telegram Markdown
-        title_escaped = title.replace("_", "\\_")
-
-        line = f"{task_id}. {title_escaped}"
+        line = f"{task_id}. {title}"
         if description:
-            desc_escaped = description.replace("_", "\\_")
-            line += f"\n   _{desc_escaped}_"
+            # Truncate long descriptions
+            desc_short = description[:100] + "..." if len(description) > 100 else description
+            line += f"\n   {desc_short}"
         lines.append(line)
 
-    lines.append(f"\nUse `/task_done <id>` to complete a task.")
+    lines.append(f"\nUse /task_done <id> to complete a task.")
     return "\n".join(lines)
 
 

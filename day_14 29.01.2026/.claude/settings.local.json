@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill:*)",
+      "Bash(source venv/bin/activate)",
+      "Bash(python bot.py:*)",
+      "Bash(sqlite3:*)",
+      "Bash(chmod:*)",
+      "Bash(\"/Users/nadzya/AiWithLoveDay1/day_13 28.01.2026/bot_service.sh\" status)",
+      "Bash(python3:*)",
+      "Bash(ls:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd day_13 28.01.2026: Planner + MCP with reminders\n\n- Kubernetes-first deployment architecture\n- MCP HTTP Server for inter-pod communication\n- Task Tracker with SQLite persistence\n- APScheduler for daily reminders\n- Fix: allow creating task with same name after completion\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push:*)",
+      "Bash(grep:*)",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(./venv/bin/pip:*)",
+      "Bash(./venv/bin/python:*)",
+      "Bash(kill:*)",
+      "WebSearch",
+      "Bash(wc:*)",
+      "Bash(./bot_service.sh:*)"
+    ]
+  }
+}

@@ -72,6 +72,23 @@ def init_database() -> None:
                 last_reminder TIMESTAMP
             )
         """)
+        # Task-specific reminders table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                reminder_time TIMESTAMP NOT NULL,
+                message TEXT,
+                is_sent INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_reminders_time
+            ON task_reminders(reminder_time, is_sent)
+        """)
         conn.commit()
     logger.info(f"Database initialized at {DB_PATH}")
 
@@ -381,6 +398,201 @@ def generate_reminder_summary(user_id: str, include_completed: bool = False) -> 
 
 
 # =============================================================================
+# Task Reminder Functions
+# =============================================================================
+
+def get_task(user_id: str, task_id: int) -> dict:
+    """
+    Get a task by ID.
+
+    Args:
+        user_id: User identifier
+        task_id: Task ID
+
+    Returns:
+        Dict with task info or error
+    """
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            """
+            SELECT id, title, description, status, created_at, completed_at
+            FROM tasks
+            WHERE id = ? AND user_id = ?
+            """,
+            (task_id, user_id)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                "success": True,
+                "task": {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "description": row["description"],
+                    "status": row["status"],
+                    "created_at": row["created_at"],
+                    "completed_at": row["completed_at"]
+                }
+            }
+        return {
+            "success": False,
+            "error": f"Task {task_id} not found"
+        }
+
+
+def update_task_description(user_id: str, task_id: int, description: str) -> dict:
+    """
+    Update a task's description.
+
+    Args:
+        user_id: User identifier
+        task_id: Task ID
+        description: New description
+
+    Returns:
+        Dict with result info
+    """
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE tasks
+            SET description = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (description, task_id, user_id)
+        )
+        conn.commit()
+
+        if cursor.rowcount > 0:
+            logger.info(f"Updated description for task {task_id}")
+            return {
+                "success": True,
+                "task_id": task_id,
+                "message": f"Task {task_id} description updated"
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Task {task_id} not found"
+            }
+
+
+def create_task_reminder(task_id: int, user_id: str, reminder_time: str,
+                         message: Optional[str] = None) -> dict:
+    """
+    Create a reminder for a task.
+
+    Args:
+        task_id: Task ID
+        user_id: User identifier
+        reminder_time: ISO format datetime string
+        message: Optional reminder message
+
+    Returns:
+        Dict with reminder info or error
+    """
+    with get_db_connection() as conn:
+        # Verify task exists and belongs to user
+        cursor = conn.execute(
+            "SELECT id, title FROM tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id)
+        )
+        task = cursor.fetchone()
+        if not task:
+            return {
+                "success": False,
+                "error": f"Task {task_id} not found"
+            }
+
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO task_reminders (task_id, user_id, reminder_time, message)
+                VALUES (?, ?, ?, ?)
+                """,
+                (task_id, user_id, reminder_time, message)
+            )
+            conn.commit()
+            reminder_id = cursor.lastrowid
+            logger.info(f"Created reminder {reminder_id} for task {task_id}")
+            return {
+                "success": True,
+                "reminder_id": reminder_id,
+                "task_id": task_id,
+                "task_title": task["title"],
+                "reminder_time": reminder_time,
+                "message": f"Reminder set for task '{task['title']}'"
+            }
+        except Exception as e:
+            logger.error(f"Error creating reminder: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+
+def get_due_task_reminders(current_time: str) -> list[dict]:
+    """
+    Get task reminders that are due.
+
+    Args:
+        current_time: ISO format datetime string
+
+    Returns:
+        List of due reminders
+    """
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            """
+            SELECT tr.id, tr.task_id, tr.user_id, tr.reminder_time,
+                   tr.message, t.title as task_title
+            FROM task_reminders tr
+            JOIN tasks t ON tr.task_id = t.id
+            WHERE tr.is_sent = 0
+            AND tr.reminder_time <= ?
+            ORDER BY tr.reminder_time
+            """,
+            (current_time,)
+        )
+        reminders = [
+            {
+                "id": row["id"],
+                "task_id": row["task_id"],
+                "user_id": row["user_id"],
+                "reminder_time": row["reminder_time"],
+                "message": row["message"],
+                "task_title": row["task_title"]
+            }
+            for row in cursor.fetchall()
+        ]
+        return reminders
+
+
+def mark_task_reminder_sent(reminder_id: int) -> dict:
+    """
+    Mark a task reminder as sent.
+
+    Args:
+        reminder_id: Reminder ID
+
+    Returns:
+        Dict with result info
+    """
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE task_reminders SET is_sent = 1 WHERE id = ?",
+            (reminder_id,)
+        )
+        conn.commit()
+
+        if cursor.rowcount > 0:
+            logger.info(f"Marked reminder {reminder_id} as sent")
+            return {"success": True, "reminder_id": reminder_id}
+        else:
+            return {"success": False, "error": f"Reminder {reminder_id} not found"}
+
+
+# =============================================================================
 # MCP Server Setup
 # =============================================================================
 
@@ -554,6 +766,100 @@ async def list_tools() -> list[Tool]:
                 "required": ["user_id"]
             }
         ),
+        Tool(
+            name="task_get",
+            description="Get a task by ID",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "User identifier"
+                    },
+                    "task_id": {
+                        "type": "integer",
+                        "description": "Task ID"
+                    }
+                },
+                "required": ["user_id", "task_id"]
+            }
+        ),
+        Tool(
+            name="task_update_description",
+            description="Update a task's description (e.g., to add a sublist)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "User identifier"
+                    },
+                    "task_id": {
+                        "type": "integer",
+                        "description": "Task ID"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New description for the task"
+                    }
+                },
+                "required": ["user_id", "task_id", "description"]
+            }
+        ),
+        Tool(
+            name="task_reminder_create",
+            description="Create a reminder for a specific task",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "Task ID to set reminder for"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User identifier"
+                    },
+                    "reminder_time": {
+                        "type": "string",
+                        "description": "ISO format datetime for reminder (e.g., 2026-01-31T14:30:00)"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Optional custom reminder message"
+                    }
+                },
+                "required": ["task_id", "user_id", "reminder_time"]
+            }
+        ),
+        Tool(
+            name="task_reminder_get_due",
+            description="Get task reminders that are due now",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "current_time": {
+                        "type": "string",
+                        "description": "Current time in ISO format"
+                    }
+                },
+                "required": ["current_time"]
+            }
+        ),
+        Tool(
+            name="task_reminder_mark_sent",
+            description="Mark a task reminder as sent",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "reminder_id": {
+                        "type": "integer",
+                        "description": "Reminder ID to mark as sent"
+                    }
+                },
+                "required": ["reminder_id"]
+            }
+        ),
     ]
 
 
@@ -611,6 +917,33 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elif name == "reminder_mark_sent":
             update_last_reminder(user_id=arguments["user_id"])
             result = {"success": True}
+        elif name == "task_get":
+            result = get_task(
+                user_id=arguments["user_id"],
+                task_id=arguments["task_id"]
+            )
+        elif name == "task_update_description":
+            result = update_task_description(
+                user_id=arguments["user_id"],
+                task_id=arguments["task_id"],
+                description=arguments["description"]
+            )
+        elif name == "task_reminder_create":
+            result = create_task_reminder(
+                task_id=arguments["task_id"],
+                user_id=arguments["user_id"],
+                reminder_time=arguments["reminder_time"],
+                message=arguments.get("message")
+            )
+        elif name == "task_reminder_get_due":
+            reminders = get_due_task_reminders(
+                current_time=arguments["current_time"]
+            )
+            result = {"reminders": reminders, "count": len(reminders)}
+        elif name == "task_reminder_mark_sent":
+            result = mark_task_reminder_sent(
+                reminder_id=arguments["reminder_id"]
+            )
         else:
             result = {"error": f"Unknown tool: {name}"}
 
