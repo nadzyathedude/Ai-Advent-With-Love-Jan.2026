@@ -1,0 +1,40 @@
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: ai-planner
+  labels:
+    app.kubernetes.io/name: ai-planner
+data:
+  # MCP Server configuration
+  MCP_SERVER_HOST: "0.0.0.0"
+  MCP_SERVER_PORT: "8080"
+
+  # Bot configuration
+  USE_HTTP_MCP: "true"
+  MCP_SERVER_URL: "http://mcp-server:8080"
+  MCP_TIMEOUT: "30"
+  MCP_MAX_RETRIES: "3"
+
+  # Data directory (mounted via PVC)
+  DATA_DIR: "/data"
+
+---
+# ConfigMap for config.py template
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bot-config-py
+  namespace: ai-planner
+  labels:
+    app.kubernetes.io/name: ai-planner
+data:
+  config.py: |
+    import os
+
+    # API tokens loaded from environment variables (Secrets)
+    api_token_telegram = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    api_token_openai = os.getenv("OPENAI_API_KEY", "")
+    api_token_perplexity = os.getenv("PERPLEXITY_API_KEY", "")

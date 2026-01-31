@@ -1,0 +1,9 @@
+---
+# Namespace for the AI Planner application
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-planner
+  labels:
+    app.kubernetes.io/name: ai-planner
+    app.kubernetes.io/part-of: ai-planner
