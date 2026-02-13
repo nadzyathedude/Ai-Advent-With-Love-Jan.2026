@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(git -C \"/Users/nadzya/AiWithLoveDay1\" status)",
-      "Bash(git -C \"/Users/nadzya/AiWithLoveDay1\" add \"day_13 28.01.2026/\")",
-      "Bash(git -C \"/Users/nadzya/AiWithLoveDay1\" status --short)"
-    ]
-  }
-}

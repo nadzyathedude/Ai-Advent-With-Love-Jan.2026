@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""CLI for the document indexing and RAG pipeline."""
+
+import argparse
+import sys
+from pathlib import Path
+
+from indexer.settings import PipelineConfig, ChunkingConfig, EmbeddingConfig, IndexConfig
+from indexer.pipeline import IndexingPipeline
+from indexer.rag import answer_question
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Index documents and ask questions with RAG",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Index a single file
+  python main.py file document.txt
+
+  # Index multiple files
+  python main.py file doc1.txt doc2.txt doc3.txt
+
+  # Index a directory (all .txt files)
+  python main.py dir ./documents
+
+  # Index directory recursively with custom pattern
+  python main.py dir ./documents --pattern "*.md" --recursive
+
+  # Custom chunk size and output
+  python main.py file document.txt --chunk-size 1000 --overlap 200 --output my_index.json
+
+  # Ask a question using RAG
+  python main.py ask document_index.json "What is this document about?"
+
+  # Ask with more context chunks
+  python main.py ask document_index.json "Summarize the key points" --top-k 10
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # File command
+    file_parser = subparsers.add_parser("file", help="Index one or more files")
+    file_parser.add_argument("files", nargs="+", help="File paths to index")
+
+    # Directory command
+    dir_parser = subparsers.add_parser("dir", help="Index files in a directory")
+    dir_parser.add_argument("directory", help="Directory path")
+    dir_parser.add_argument(
+        "--pattern", default="*.txt",
+        help="Glob pattern for files (default: *.txt)"
+    )
+    dir_parser.add_argument(
+        "--recursive", "-r", action="store_true",
+        help="Search recursively"
+    )
+
+    # Text command (from stdin)
+    text_parser = subparsers.add_parser("text", help="Index text from stdin")
+    text_parser.add_argument(
+        "--doc-id", default="stdin",
+        help="Document ID (default: stdin)"
+    )
+
+    # Ask command (RAG)
+    ask_parser = subparsers.add_parser("ask", help="Ask a question using RAG")
+    ask_parser.add_argument("index_file", help="Path to the JSON index file")
+    ask_parser.add_argument("question", help="Question to ask")
+    ask_parser.add_argument(
+        "--top-k", type=int, default=5,
+        help="Number of chunks to retrieve (default: 5)"
+    )
+    ask_parser.add_argument(
+        "--model", default="gpt-4o-mini",
+        help="LLM model for generation (default: gpt-4o-mini)"
+    )
+
+    # Common arguments for all commands
+    for p in [file_parser, dir_parser, text_parser]:
+        p.add_argument(
+            "--output", "-o", default="document_index.json",
+            help="Output JSON file path (default: document_index.json)"
+        )
+        p.add_argument(
+            "--chunk-size", type=int, default=800,
+            help="Chunk size in characters (default: 800)"
+        )
+        p.add_argument(
+            "--overlap", type=int, default=150,
+            help="Chunk overlap in characters (default: 150)"
+        )
+        p.add_argument(
+            "--model", default="text-embedding-3-small",
+            help="Embedding model (default: text-embedding-3-small)"
+        )
+        p.add_argument(
+            "--batch-size", type=int, default=64,
+            help="Batch size for embedding requests (default: 64)"
+        )
+
+    args = parser.parse_args()
+
+    # Handle RAG ask command separately
+    if args.command == "ask":
+        try:
+            from indexer.settings import LLMConfig
+            from indexer.llm import OpenAILLM
+
+            llm = OpenAILLM(LLMConfig(model=args.model))
+            result = answer_question(
+                question=args.question,
+                index_path=args.index_file,
+                top_k=args.top_k,
+                llm_provider=llm,
+            )
+            print(result)
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error during RAG: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Build configuration for indexing commands
+    config = PipelineConfig(
+        chunking=ChunkingConfig(
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.overlap
+        ),
+        embedding=EmbeddingConfig(
+            model=args.model,
+            batch_size=args.batch_size
+        ),
+        index=IndexConfig(
+            output_path=args.output
+        )
+    )
+
+    try:
+        pipeline = IndexingPipeline(config)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    total_chunks = 0
+
+    try:
+        if args.command == "file":
+            for file_path in args.files:
+                if not Path(file_path).exists():
+                    print(f"Warning: File not found: {file_path}", file=sys.stderr)
+                    continue
+                chunks = pipeline.add_file(file_path)
+                print(f"Indexed {file_path}: {chunks} chunks")
+                total_chunks += chunks
+
+        elif args.command == "dir":
+            if not Path(args.directory).is_dir():
+                print(f"Error: Not a directory: {args.directory}", file=sys.stderr)
+                sys.exit(1)
+            total_chunks = pipeline.add_directory(
+                args.directory,
+                pattern=args.pattern,
+                recursive=args.recursive
+            )
+            print(f"Indexed directory {args.directory}: {total_chunks} chunks")
+
+        elif args.command == "text":
+            text = sys.stdin.read()
+            if not text.strip():
+                print("Error: No text provided on stdin", file=sys.stderr)
+                sys.exit(1)
+            total_chunks = pipeline.add_text(text, args.doc_id)
+            print(f"Indexed stdin: {total_chunks} chunks")
+
+        if total_chunks > 0:
+            output_path = pipeline.save()
+            stats = pipeline.get_stats()
+            print(f"\nIndex saved to: {output_path}")
+            print(f"Total documents: {stats['total_documents']}")
+            print(f"Total chunks: {stats['total_chunks']}")
+            print(f"Embedding model: {stats['embedding_model']}")
+        else:
+            print("No content indexed.", file=sys.stderr)
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"Error during indexing: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

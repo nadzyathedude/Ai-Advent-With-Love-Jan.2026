@@ -21,17 +21,3 @@ config.py
 
 # OS
 .DS_Store
-*.db
-
-# Runtime
-bot.log
-bot.pid
-
-# Claude Code local settings
-.claude/
-
-# Index files with potential secrets
-day15_index.json
-
-# Temp
-temp_repo/
