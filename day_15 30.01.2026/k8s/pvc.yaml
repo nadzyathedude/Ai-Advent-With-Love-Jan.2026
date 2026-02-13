@@ -1,0 +1,37 @@
+---
+# PersistentVolumeClaim for MCP Server data (tasks.db)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mcp-server-data
+  namespace: ai-planner
+  labels:
+    app.kubernetes.io/name: ai-planner
+    app.kubernetes.io/component: mcp-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # Uncomment and set storageClassName for your cluster
+  # storageClassName: standard
+
+---
+# PersistentVolumeClaim for Bot data (conversations, memory)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bot-data
+  namespace: ai-planner
+  labels:
+    app.kubernetes.io/name: ai-planner
+    app.kubernetes.io/component: bot
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  # Uncomment and set storageClassName for your cluster
+  # storageClassName: standard

@@ -1,0 +1,19 @@
+---
+# Kustomization file for deploying all resources
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ai-planner
+
+resources:
+  - namespace.yaml
+  - secrets.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - mcp-server.yaml
+  - telegram-bot.yaml
+
+# Common labels
+commonLabels:
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/version: "1.0.0"

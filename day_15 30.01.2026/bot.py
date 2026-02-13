@@ -1,0 +1,2301 @@
+import asyncio
+import logging
+import os
+import re
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    filters,
+    ContextTypes,
+)
+from telegram.constants import ChatAction
+from openai import OpenAI
+
+from config import api_token_telegram, api_token_openai, api_token_perplexity
+
+# Optional Yandex Calendar credentials
+try:
+    from config import yandex_calendar_username, yandex_calendar_password
+except ImportError:
+    yandex_calendar_username = ""
+    yandex_calendar_password = ""
+
+# Environment configuration for Kubernetes
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8080")
+USE_HTTP_MCP = os.getenv("USE_HTTP_MCP", "false").lower() == "true"
+from models import (
+    SUPPORTED_MODELS,
+    get_model_info,
+    validate_and_get_model,
+    format_model_list,
+    get_default_model,
+)
+from storage import (
+    init_database,
+    get_user_model,
+    set_user_model,
+    get_user_show_tokens,
+    set_user_show_tokens,
+)
+from token_usage import get_usage_report, format_usage_report
+from conversation_store import init_conversation_store, get_conversation_store
+from external_memory import init_external_memory, get_external_memory
+from memory_retrieval import init_memory_retrieval, get_memory_retrieval
+from summary_manager import SummaryManager
+from mcp_client import init_mcp_client, get_mcp_tools, format_tools_for_telegram, ask_perplexity
+from task_tracker_client import (
+    init_task_tracker_client,
+    get_task_tracker_client,
+    get_task_tracker_tools,
+    format_tasks_for_telegram,
+    format_open_count_for_telegram,
+)
+from mcp_http_client import (
+    init_mcp_http_client,
+    get_mcp_http_client,
+    close_mcp_http_client,
+)
+from scheduler import init_scheduler, start_scheduler, stop_scheduler, get_scheduler
+from yandex_calendar import (
+    init_yandex_calendar,
+    is_calendar_enabled,
+    add_task_to_calendar,
+    delete_task_from_calendar,
+)
+
+# Настройка логирования
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Инициализация OpenAI клиента
+client = OpenAI(api_key=api_token_openai)
+
+# Summary manager (initialized after conversation store in main())
+summary_manager: SummaryManager = None
+
+# Telegram application (for scheduler callbacks)
+telegram_app: Application = None
+
+# Callback data prefix for model selection
+MODEL_CALLBACK_PREFIX = "select_model:"
+
+# Callback data prefixes for summary setup
+STORAGE_CALLBACK_PREFIX = "storage_type:"
+
+# Conversation states for /summary setup flow
+(
+    WAITING_FOR_STORAGE_TYPE,
+    WAITING_FOR_THRESHOLD,
+) = range(2)
+
+# Conversation states for /task_add flow
+(
+    WAITING_FOR_SUBLIST_DECISION,
+    WAITING_FOR_REMINDER_DECISION,
+    WAITING_FOR_CUSTOM_REMINDER_TIME,
+    WAITING_FOR_CALENDAR_DECISION,
+    WAITING_FOR_CALENDAR_DATETIME,
+) = range(10, 15)
+
+# Conversation states for /reminder email flow
+(
+    WAITING_FOR_EMAIL_DECISION,
+    WAITING_FOR_EMAIL_ADDRESS,
+) = range(20, 22)
+
+# Callback data prefixes for task creation flow
+SUBLIST_CALLBACK_PREFIX = "sublist:"
+REMINDER_CALLBACK_PREFIX = "task_reminder:"
+CALENDAR_CALLBACK_PREFIX = "calendar:"
+EMAIL_CALLBACK_PREFIX = "email_notify:"
+
+# Системный промпт для GPT
+SYSTEM_PROMPT = """Ты — умный и дружелюбный ассистент в Telegram.
+
+## Правила ответов:
+
+### Для простых вопросов:
+- Отвечай кратко и по существу
+- Не растягивай ответ без необходимости
+
+### Для сложных вопросов (математика, логика, программирование, анализ):
+- Используй пошаговое рассуждение (Chain of Thought)
+- Структура: 1) Анализ задачи → 2) Шаги решения → 3) Ответ/вывод
+
+### Форматирование (Markdown для Telegram):
+- **жирный** для важного
+- `код` для терминов и коротких команд
+- Блоки кода:
+```язык
+код здесь
+```
+- Списки через - или 1. 2. 3.
+
+### Стиль:
+- Дружелюбный, но профессиональный тон
+- Если не знаешь ответ — честно скажи
+- На русском, если пользователь пишет на русском"""
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /start"""
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Привет, {user.first_name}!\n\n"
+        "Я бот с искусственным интеллектом.\n"
+        "Просто напиши мне сообщение, и я постараюсь помочь!\n\n"
+        "Используй /help для справки."
+    )
+    await update.message.reply_text(
+        "Чтобы увидеть все доступные команды, используй /show_commands"
+    )
+    logger.info(f"Пользователь {user.id} ({user.username}) запустил бота")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /help"""
+    help_text = """**Что я умею:**
+
+- Отвечать на вопросы
+- Помогать с кодом
+- Объяснять сложные темы
+- Решать задачи
+- Запоминать контекст диалога
+- Управлять задачами (Task Tracker)
+- Напоминать о задачах по расписанию
+
+**Команды:**
+/start — начать сначала
+/help — эта справка
+/set\\_model — выбрать модель ИИ
+/tokens — управление отчётом о токенах
+/task\\_add — добавить задачу (+ AI sublist)
+/task\\_remind — напомнить о задаче
+/reminder — управление напоминаниями
+/show\\_commands — список всех команд
+
+Просто напиши сообщение!"""
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+
+async def show_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /show_commands - показывает все доступные команды"""
+    commands_text = """**Доступные команды:**
+
+**Основные:**
+/start — Запустить бота
+/help — Справка о возможностях
+/set\\_model — Выбрать модель ИИ
+/current\\_model — Текущая модель
+/tokens — Отчёт о токенах (on/off)
+/show\\_commands — Этот список
+
+**Задачи (MCP):**
+/tasks — Количество открытых задач
+/task\\_add — Добавить задачу (+ sublist + reminder)
+/task\\_list — Список задач
+/task\\_done — Завершить задачу
+/task\\_remind — Напомнить о задаче
+/task\\_tools — MCP инструменты
+
+**Напоминания:**
+/reminder on — Включить напоминания
+/reminder off — Выключить
+/reminder now — Получить сводку сейчас
+/reminder status — Статус напоминаний
+/reminder set HH:MM — Установить время
+/reminder\\_email — Email уведомления
+
+**Память:**
+/summary — Настроить внешнюю память
+/summary\\_status — Статус памяти
+/summary\\_on — Включить
+/summary\\_off — Выключить
+/clear\\_history — Очистить историю
+
+**MCP:**
+/mcp\\_tools — Инструменты Perplexity"""
+    await update.message.reply_text(commands_text, parse_mode="Markdown")
+
+
+async def set_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /set_model - показывает клавиатуру выбора модели"""
+    user = update.effective_user
+    current_model = get_user_model(user.id)
+
+    # Создаём инлайн-клавиатуру с моделями
+    keyboard = []
+    for model_id, model_info in SUPPORTED_MODELS.items():
+        # Отмечаем текущую модель галочкой
+        marker = " ✓" if model_id == current_model else ""
+        button_text = f"{model_info.display_name}{marker}"
+        keyboard.append([
+            InlineKeyboardButton(
+                button_text,
+                callback_data=f"{MODEL_CALLBACK_PREFIX}{model_id}"
+            )
+        ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        format_model_list() + "\n\n**Выберите модель:**",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+    logger.info(f"Пользователь {user.id} открыл меню выбора модели")
+
+
+async def model_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик выбора модели через инлайн-кнопку"""
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    callback_data = query.data
+
+    if not callback_data.startswith(MODEL_CALLBACK_PREFIX):
+        return
+
+    selected_model = callback_data[len(MODEL_CALLBACK_PREFIX):]
+
+    # Валидируем выбранную модель
+    valid_model, was_fallback = validate_and_get_model(selected_model)
+
+    if was_fallback:
+        await query.edit_message_text(
+            f"Модель `{selected_model}` недоступна.\n"
+            f"Установлена модель по умолчанию: `{valid_model}`",
+            parse_mode="Markdown"
+        )
+        logger.warning(f"Пользователь {user.id} попытался выбрать недоступную модель: {selected_model}")
+    else:
+        model_info = get_model_info(valid_model)
+        await query.edit_message_text(
+            f"Модель успешно изменена!\n\n"
+            f"**Выбрана:** `{valid_model}`\n"
+            f"**Описание:** {model_info.description}",
+            parse_mode="Markdown"
+        )
+        logger.info(f"Пользователь {user.id} выбрал модель: {valid_model}")
+
+    # Сохраняем выбор пользователя
+    set_user_model(user.id, valid_model)
+
+
+async def current_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /current_model - показывает текущую модель пользователя"""
+    user = update.effective_user
+    stored_model = get_user_model(user.id)
+
+    # Валидируем сохранённую модель (на случай если она стала недоступна)
+    valid_model, was_fallback = validate_and_get_model(stored_model)
+
+    if was_fallback and stored_model is not None:
+        # Модель стала недоступна, обновляем в базе
+        set_user_model(user.id, valid_model)
+        await update.message.reply_text(
+            f"Ваша предыдущая модель `{stored_model}` больше недоступна.\n"
+            f"Установлена модель по умолчанию: `{valid_model}`\n\n"
+            "Используйте /set\\_model для выбора другой модели.",
+            parse_mode="Markdown"
+        )
+    else:
+        model_info = get_model_info(valid_model)
+        is_default = stored_model is None
+        status = " (по умолчанию)" if is_default else ""
+
+        await update.message.reply_text(
+            f"**Текущая модель:** `{valid_model}`{status}\n"
+            f"**Описание:** {model_info.description}\n\n"
+            "Используйте /set\\_model для выбора другой модели.",
+            parse_mode="Markdown"
+        )
+
+    logger.info(f"Пользователь {user.id} проверил текущую модель: {valid_model}")
+
+
+async def tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /tokens - управление отображением информации о токенах"""
+    user = update.effective_user
+    args = context.args
+
+    current_setting = get_user_show_tokens(user.id)
+
+    if not args:
+        # Показываем текущий статус
+        status = "включён" if current_setting else "выключен"
+        await update.message.reply_text(
+            f"**Отчёт о токенах:** {status}\n\n"
+            "Используйте:\n"
+            "• `/tokens on` — включить отчёт\n"
+            "• `/tokens off` — выключить отчёт",
+            parse_mode="Markdown"
+        )
+        return
+
+    arg = args[0].lower()
+
+    if arg == "on":
+        set_user_show_tokens(user.id, True)
+        await update.message.reply_text(
+            "Отчёт о токенах **включён**.\n"
+            "После каждого ответа вы будете видеть информацию о токенах и стоимости.",
+            parse_mode="Markdown"
+        )
+        logger.info(f"Пользователь {user.id} включил отчёт о токенах")
+    elif arg == "off":
+        set_user_show_tokens(user.id, False)
+        await update.message.reply_text(
+            "Отчёт о токенах **выключен**.\n"
+            "Используйте `/tokens on` чтобы включить снова.",
+            parse_mode="Markdown"
+        )
+        logger.info(f"Пользователь {user.id} выключил отчёт о токенах")
+    else:
+        await update.message.reply_text(
+            "Неизвестный параметр. Используйте:\n"
+            "• `/tokens on` — включить отчёт\n"
+            "• `/tokens off` — выключить отчёт\n"
+            "• `/tokens` — показать текущий статус",
+            parse_mode="Markdown"
+        )
+
+
+def get_user_model_for_request(user_id: int) -> tuple[str, bool]:
+    """
+    Получить модель для запроса к OpenAI.
+
+    Returns:
+        tuple: (model_id, was_fallback)
+    """
+    stored_model = get_user_model(user_id)
+    return validate_and_get_model(stored_model)
+
+
+# =============================================================================
+# Summary Commands (External Memory Setup)
+# =============================================================================
+
+async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Обработчик команды /summary - начинает настройку внешней памяти.
+
+    Step A: Ask for storage type first.
+
+    Returns:
+        WAITING_FOR_STORAGE_TYPE state to continue conversation
+    """
+    user = update.effective_user
+    logger.info(f"User {user.id} started /summary setup")
+
+    # Create inline keyboard for storage type selection
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "SQLite (рекомендуется)",
+                callback_data=f"{STORAGE_CALLBACK_PREFIX}sqlite"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "JSON файл",
+                callback_data=f"{STORAGE_CALLBACK_PREFIX}json"
+            )
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "**Настройка внешней памяти**\n\n"
+        "Внешняя память позволяет боту помнить важную информацию "
+        "из ваших разговоров даже после перезапуска.\n\n"
+        "**Шаг 1/2:** Выберите формат хранения:\n\n"
+        "• **SQLite** — быстрая база данных, рекомендуется\n"
+        "• **JSON** — простой текстовый файл\n\n"
+        "_Для отмены отправьте /cancel_",
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
+    return WAITING_FOR_STORAGE_TYPE
+
+
+async def storage_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Обработчик выбора типа хранилища через инлайн-кнопку.
+
+    Returns:
+        WAITING_FOR_THRESHOLD state to continue to step 2
+    """
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    callback_data = query.data
+
+    if not callback_data.startswith(STORAGE_CALLBACK_PREFIX):
+        return WAITING_FOR_STORAGE_TYPE
+
+    storage_type = callback_data[len(STORAGE_CALLBACK_PREFIX):]
+
+    if storage_type not in ("sqlite", "json"):
+        await query.edit_message_text(
+            "Неверный выбор. Пожалуйста, выберите `sqlite` или `json`.",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_STORAGE_TYPE
+
+    # Store the choice in context for later use
+    context.user_data["storage_type"] = storage_type
+
+    storage_name = "SQLite" if storage_type == "sqlite" else "JSON"
+
+    await query.edit_message_text(
+        f"Выбрано: **{storage_name}**\n\n"
+        f"**Шаг 2/2:** После какого количества сообщений сжимать диалог?\n\n"
+        "Отправьте число от 1 до 500.\n"
+        "_Рекомендуемое значение: 10-20 сообщений._\n\n"
+        "_Для отмены отправьте /cancel_",
+        parse_mode="Markdown"
+    )
+
+    logger.info(f"User {user.id} selected storage type: {storage_type}")
+    return WAITING_FOR_THRESHOLD
+
+
+async def summary_threshold_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Обработчик ввода порога сообщений для сжатия.
+
+    Returns:
+        ConversationHandler.END to finish conversation
+    """
+    user = update.effective_user
+    text = update.message.text.strip()
+
+    # Validate input
+    try:
+        threshold = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "Пожалуйста, отправьте число от 1 до 500.\n"
+            "Для отмены отправьте /cancel",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_THRESHOLD
+
+    # Validate range
+    if threshold < 1:
+        await update.message.reply_text(
+            "Число должно быть не меньше 1.\n"
+            "Пожалуйста, отправьте число от 1 до 500.",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_THRESHOLD
+
+    if threshold > 500:
+        await update.message.reply_text(
+            "Число должно быть не больше 500.\n"
+            "Пожалуйста, отправьте число от 1 до 500.",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_THRESHOLD
+
+    # Get storage type from context
+    storage_type = context.user_data.get("storage_type", "sqlite")
+
+    # Enable summarization with the threshold and storage type
+    summary_manager.enable_summarization(user.id, threshold, storage_type)
+
+    storage_name = "SQLite" if storage_type == "sqlite" else "JSON"
+
+    await update.message.reply_text(
+        f"Внешняя память настроена!\n\n"
+        f"• **Хранилище:** {storage_name}\n"
+        f"• **Порог сжатия:** {threshold} сообщений\n\n"
+        "Теперь бот будет:\n"
+        "• Сохранять все сообщения во внешнюю память\n"
+        "• Архивировать старые сообщения (не удаляя их)\n"
+        "• Создавать сводки для сохранения контекста\n"
+        "• Искать релевантную информацию в истории\n\n"
+        "Команды управления:\n"
+        "• `/summary_status` — текущий статус\n"
+        "• `/summary_off` — отключить\n"
+        "• `/summary_on` — включить\n"
+        "• `/summary_now` — сжать сейчас",
+        parse_mode="Markdown"
+    )
+
+    logger.info(
+        f"User {user.id} enabled external memory: "
+        f"storage={storage_type}, threshold={threshold}"
+    )
+    return ConversationHandler.END
+
+
+async def summary_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отмена настройки внешней памяти."""
+    await update.message.reply_text(
+        "Настройка внешней памяти отменена.",
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+
+async def summary_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /summary_status - показывает статус внешней памяти."""
+    user = update.effective_user
+    status = summary_manager.get_status(user.id)
+
+    if status["memory_enabled"]:
+        enabled_text = "включена"
+        storage_text = f"Хранилище: **{status['storage_type'].upper()}**"
+        threshold_text = f"Порог сжатия: **{status['message_threshold']}** сообщений"
+        count_text = f"Сообщений с последнего сжатия: **{status['current_message_count']}**"
+        until_text = f"До следующего сжатия: **{status['messages_until_next_summary']}** сообщений"
+    elif status["enabled"]:
+        # Legacy mode
+        enabled_text = "включена (устаревший режим)"
+        storage_text = "Хранилище: **legacy**"
+        threshold_text = f"Порог: **{status['message_threshold']}** сообщений"
+        count_text = f"Счётчик: **{status['current_message_count']}**"
+        until_text = f"До сжатия: **{status['messages_until_next_summary']}** сообщений"
+    else:
+        enabled_text = "выключена"
+        storage_text = ""
+        threshold_text = ""
+        count_text = ""
+        until_text = ""
+
+    total_messages = f"Всего сообщений: **{status['total_messages_in_history']}**"
+    archived = f"Архивировано: **{status['archived_messages']}**"
+    summaries = f"Активных сводок: **{status['active_summaries']}**"
+    max_level = f"Макс. уровень сжатия: **{status['max_summary_level']}**"
+
+    lines = [
+        f"**Статус внешней памяти:** {enabled_text}",
+        "",
+    ]
+
+    if status["memory_enabled"] or status["enabled"]:
+        lines.extend([storage_text, threshold_text, count_text, until_text, ""])
+
+    lines.extend([total_messages, archived, summaries, max_level])
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    logger.info(f"User {user.id} checked summary status")
+
+
+async def summary_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /summary_off - отключает внешнюю память."""
+    user = update.effective_user
+    summary_manager.disable_summarization(user.id)
+
+    await update.message.reply_text(
+        "Внешняя память **отключена**.\n\n"
+        "Данные сохранены. "
+        "Используйте /summary\\_on чтобы включить снова.",
+        parse_mode="Markdown"
+    )
+    logger.info(f"User {user.id} disabled external memory")
+
+
+async def summary_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /summary_on - включает внешнюю память."""
+    user = update.effective_user
+
+    # Check if user has existing config
+    memory = get_external_memory()
+    config = memory.get_user_config(user.id)
+
+    if config is None:
+        await update.message.reply_text(
+            "Внешняя память ещё не настроена.\n"
+            "Используйте /summary для настройки.",
+            parse_mode="Markdown"
+        )
+        return
+
+    summary_manager.enable_external_memory(user.id)
+
+    await update.message.reply_text(
+        "Внешняя память **включена**.\n\n"
+        f"Хранилище: **{config.storage_type.upper()}**\n"
+        f"Порог сжатия: **{config.summary_every_n}** сообщений",
+        parse_mode="Markdown"
+    )
+    logger.info(f"User {user.id} enabled external memory")
+
+
+async def summary_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /summary_now - принудительное сжатие."""
+    user = update.effective_user
+
+    status = summary_manager.get_status(user.id)
+
+    # Check if using external memory
+    if status["memory_enabled"]:
+        memory = get_external_memory()
+        messages = memory.get_messages_since_last_summary(user.id)
+        if not messages:
+            await update.message.reply_text(
+                "Нечего сжимать — нет новых сообщений.",
+                parse_mode="Markdown"
+            )
+            return
+    else:
+        if status["total_messages_in_history"] == 0:
+            await update.message.reply_text(
+                "Нечего сжимать — история диалога пуста.",
+                parse_mode="Markdown"
+            )
+            return
+
+    await update.message.reply_text(
+        "Сжимаю диалог...",
+        parse_mode="Markdown"
+    )
+
+    success = await summary_manager.force_summarize(user.id)
+
+    if success:
+        new_status = summary_manager.get_status(user.id)
+        await update.message.reply_text(
+            "Диалог успешно сжат!\n\n"
+            f"Всего сообщений: **{new_status['total_messages_in_history']}**\n"
+            f"Архивировано: **{new_status['archived_messages']}**\n"
+            f"Активных сводок: **{new_status['active_summaries']}**",
+            parse_mode="Markdown"
+        )
+        logger.info(f"User {user.id} forced summarization successfully")
+    else:
+        await update.message.reply_text(
+            "Не удалось сжать диалог. Попробуйте позже.\n"
+            "Данные сохранены.",
+            parse_mode="Markdown"
+        )
+        logger.error(f"User {user.id} forced summarization failed")
+
+
+async def clear_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /clear_history - очистка истории диалога."""
+    user = update.effective_user
+    store = get_conversation_store()
+    store.clear_conversation(user.id)
+
+    await update.message.reply_text(
+        "История диалога очищена.\n"
+        "Начинаем разговор с чистого листа!\n\n"
+        "_Примечание: внешняя память сохранена отдельно._",
+        parse_mode="Markdown"
+    )
+    logger.info(f"User {user.id} cleared conversation history")
+
+
+# =============================================================================
+# MCP Tools Command
+# =============================================================================
+
+async def mcp_tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик команды /mcp_tools - показывает доступные MCP инструменты.
+
+    Queries the Perplexity MCP Server for available tools and displays them.
+    """
+    user = update.effective_user
+    logger.info(f"User {user.id} requested MCP tools list")
+
+    # Show typing indicator while connecting to MCP server
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    await update.message.reply_text(
+        "Connecting to Perplexity MCP Server...",
+        parse_mode="Markdown"
+    )
+
+    try:
+        # Get tools from MCP server
+        result = await get_mcp_tools()
+
+        # Format and send response
+        response_text = format_tools_for_telegram(result)
+
+        await update.message.reply_text(
+            response_text,
+            parse_mode="Markdown"
+        )
+
+        if result.error:
+            logger.error(f"MCP tools error for user {user.id}: {result.error}")
+        else:
+            logger.info(f"User {user.id} received {len(result.tools)} MCP tools")
+
+    except Exception as e:
+        logger.error(f"Error fetching MCP tools for user {user.id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"*Error:* Failed to fetch MCP tools.\n{e}",
+            parse_mode="Markdown"
+        )
+
+
+# =============================================================================
+# Task Tracker Commands (MCP Integration)
+# =============================================================================
+
+async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик команды /tasks - показывает количество открытых задач.
+
+    Calls the Task Tracker MCP Server to get the open task count.
+    """
+    user = update.effective_user
+    logger.info(f"User {user.id} requested open tasks count")
+
+    # Show typing indicator
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    try:
+        client = get_task_tracker_client()
+        if client is None:
+            await update.message.reply_text(
+                "Task Tracker not initialized.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Call MCP tool to get open count for this user
+        result = await client.get_open_count(user_id=str(user.id))
+
+        if result.success and result.data:
+            count = result.data.get("count", 0)
+            await update.message.reply_text(
+                f"**Open tasks:** {count}\n\n"
+                "Use `/task_list` to see all tasks.\n"
+                "Use `/task_add <title>` to add a new task.",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"*Error:* {result.error}",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error(f"Error getting task count for user {user.id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"*Error:* Failed to get task count.\n{e}",
+            parse_mode="Markdown"
+        )
+
+
+async def task_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Обработчик команды /task_add - добавляет новую задачу.
+
+    Enhanced version: After creating the task, asks about sublist and reminder.
+
+    Usage: /task_add <title> [| description]
+    """
+    user = update.effective_user
+    logger.info(f"User {user.id} adding a task")
+
+    # Parse arguments
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/task_add <title>` or `/task_add <title> | <description>`",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+    # Join all arguments
+    full_text = " ".join(context.args)
+
+    # Check for description separator
+    if " | " in full_text:
+        parts = full_text.split(" | ", 1)
+        title = parts[0].strip()
+        description = parts[1].strip() if len(parts) > 1 else None
+    else:
+        title = full_text.strip()
+        description = None
+
+    if not title:
+        await update.message.reply_text(
+            "Task title cannot be empty.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+    # Show typing indicator
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    try:
+        client = get_task_tracker_client()
+        if client is None:
+            await update.message.reply_text(
+                "Task Tracker not initialized.",
+                parse_mode="Markdown"
+            )
+            return ConversationHandler.END
+
+        # Call MCP tool to create task
+        result = await client.create_task(
+            user_id=str(user.id),
+            title=title,
+            description=description
+        )
+
+        if result.success and result.data:
+            task_id = result.data.get("task_id", "?")
+
+            # Store task info for later use in conversation
+            context.user_data["pending_task_id"] = task_id
+            context.user_data["pending_task_title"] = title
+            context.user_data["pending_task_description"] = description
+
+            await update.message.reply_text(
+                f"Task created: **{title}**"
+                + (f"\n_{description}_" if description else ""),
+                parse_mode="Markdown"
+            )
+            logger.info(f"User {user.id} created task {task_id}: {title}")
+
+            # Ask about sublist generation
+            keyboard = [
+                [
+                    InlineKeyboardButton("Yes", callback_data=f"{SUBLIST_CALLBACK_PREFIX}yes"),
+                    InlineKeyboardButton("No", callback_data=f"{SUBLIST_CALLBACK_PREFIX}no"),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                "Would you like me to generate a to-do sublist for this task?",
+                reply_markup=reply_markup
+            )
+            return WAITING_FOR_SUBLIST_DECISION
+        else:
+            await update.message.reply_text(
+                f"*Error:* {result.error}",
+                parse_mode="Markdown"
+            )
+            return ConversationHandler.END
+
+    except Exception as e:
+        logger.error(f"Error creating task for user {user.id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"*Error:* Failed to create task.\n{e}",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+
+async def sublist_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the sublist generation decision."""
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    callback_data = query.data
+
+    if not callback_data.startswith(SUBLIST_CALLBACK_PREFIX):
+        return WAITING_FOR_SUBLIST_DECISION
+
+    decision = callback_data[len(SUBLIST_CALLBACK_PREFIX):]
+    task_id = context.user_data.get("pending_task_id")
+    task_title = context.user_data.get("pending_task_title", "Task")
+
+    if decision == "yes":
+        await query.edit_message_text("Generating sublist with Perplexity AI...")
+
+        try:
+            # Call Perplexity to generate sublist
+            prompt = f"Generate a short to-do checklist (3-5 items) for this task: '{task_title}'. Format as a simple bullet list with - prefix. No markdown, plain text only."
+            result = await ask_perplexity(prompt)
+
+            if result.success and result.data:
+                sublist_text = result.data.get("text", "")
+
+                # Update task description with the sublist
+                client = get_task_tracker_client()
+                if client and task_id:
+                    await client.update_task_description(
+                        user_id=str(user.id),
+                        task_id=task_id,
+                        description=f"Sublist:\n{sublist_text}"
+                    )
+
+                # Send without Markdown to avoid parsing errors
+                await query.edit_message_text(
+                    f"Sublist generated and added to task:\n\n{sublist_text}"
+                )
+                logger.info(f"User {user.id} generated sublist for task {task_id}")
+            else:
+                await query.edit_message_text(
+                    f"Could not generate sublist: {result.error}\n"
+                    "Continuing without sublist."
+                )
+
+        except Exception as e:
+            logger.error(f"Error generating sublist: {e}", exc_info=True)
+            await query.edit_message_text(
+                f"Error generating sublist: {e}\nContinuing without sublist."
+            )
+    else:
+        await query.edit_message_text("Skipping sublist generation.")
+
+    # Now ask about reminder
+    return await _ask_reminder_decision(update, context)
+
+
+async def _ask_reminder_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask about setting a reminder for the task."""
+    keyboard = [
+        [
+            InlineKeyboardButton("1h", callback_data=f"{REMINDER_CALLBACK_PREFIX}1h"),
+            InlineKeyboardButton("3h", callback_data=f"{REMINDER_CALLBACK_PREFIX}3h"),
+            InlineKeyboardButton("Tomorrow 9:00", callback_data=f"{REMINDER_CALLBACK_PREFIX}tomorrow"),
+        ],
+        [
+            InlineKeyboardButton("Custom time", callback_data=f"{REMINDER_CALLBACK_PREFIX}custom"),
+            InlineKeyboardButton("No reminder", callback_data=f"{REMINDER_CALLBACK_PREFIX}none"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Get the message to reply to
+    if update.callback_query:
+        await update.callback_query.message.reply_text(
+            "When should I remind you about this task?",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            "When should I remind you about this task?",
+            reply_markup=reply_markup
+        )
+
+    return WAITING_FOR_REMINDER_DECISION
+
+
+async def reminder_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the reminder time decision."""
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    callback_data = query.data
+
+    if not callback_data.startswith(REMINDER_CALLBACK_PREFIX):
+        return WAITING_FOR_REMINDER_DECISION
+
+    decision = callback_data[len(REMINDER_CALLBACK_PREFIX):]
+    task_id = context.user_data.get("pending_task_id")
+    task_title = context.user_data.get("pending_task_title", "Task")
+
+    if decision == "none":
+        await query.edit_message_text("No reminder set.")
+        # Ask about Yandex Calendar
+        return await _ask_calendar_decision(update, context)
+
+    if decision == "custom":
+        await query.edit_message_text(
+            "Enter reminder time. Supported formats:\n"
+            "• `in 2 hours` / `in 30 minutes`\n"
+            "• `tomorrow 9:00`\n"
+            "• `14:30` (today or tomorrow)\n"
+            "• `2026-02-01 10:00`\n\n"
+            "Or /cancel to skip.",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_CUSTOM_REMINDER_TIME
+
+    # Calculate reminder time based on decision
+    now = datetime.now()
+
+    if decision == "1h":
+        reminder_time = now + timedelta(hours=1)
+    elif decision == "3h":
+        reminder_time = now + timedelta(hours=3)
+    elif decision == "tomorrow":
+        # Tomorrow at 9:00
+        reminder_time = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    else:
+        await query.edit_message_text("Unknown option. No reminder set.")
+        _clear_pending_task(context)
+        return ConversationHandler.END
+
+    # Create the reminder
+    success = await _create_task_reminder(user.id, task_id, reminder_time, context)
+
+    if success:
+        time_str = reminder_time.strftime("%Y-%m-%d %H:%M")
+        message = f"Reminder set for **{time_str}**!"
+    else:
+        message = "Failed to set reminder."
+
+    await query.edit_message_text(message, parse_mode="Markdown")
+
+    # Ask about Yandex Calendar
+    return await _ask_calendar_decision(update, context)
+
+
+async def custom_reminder_time_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parse custom reminder time input."""
+    user = update.effective_user
+    text = update.message.text.strip()
+
+    task_id = context.user_data.get("pending_task_id")
+    task_title = context.user_data.get("pending_task_title", "Task")
+
+    # Parse the time
+    reminder_time = parse_reminder_time(text)
+
+    if reminder_time is None:
+        await update.message.reply_text(
+            "Could not parse time. Please try again or /cancel.\n\n"
+            "Examples: `in 2 hours`, `tomorrow 9:00`, `14:30`, `2026-02-01 10:00`",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_CUSTOM_REMINDER_TIME
+
+    # Create the reminder
+    success = await _create_task_reminder(user.id, task_id, reminder_time, context)
+
+    time_str = reminder_time.strftime("%Y-%m-%d %H:%M")
+    if success:
+        message = f"Reminder set for **{time_str}**!"
+    else:
+        message = "Failed to set reminder."
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+    # Ask about Yandex Calendar
+    return await _ask_calendar_decision(update, context)
+
+
+def parse_reminder_time(text: str) -> datetime | None:
+    """
+    Parse reminder time from various formats.
+
+    Supported formats:
+    - "in X hours" / "in X minutes"
+    - "tomorrow HH:MM"
+    - "HH:MM" (today or tomorrow if past)
+    - "YYYY-MM-DD HH:MM"
+
+    Returns:
+        datetime object or None if parsing failed
+    """
+    text = text.lower().strip()
+    now = datetime.now()
+
+    # Pattern: "in X hours" or "in X minutes"
+    match = re.match(r'in\s+(\d+)\s*(hours?|h|minutes?|min|m)', text)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2)
+        if unit.startswith('h'):
+            return now + timedelta(hours=amount)
+        else:
+            return now + timedelta(minutes=amount)
+
+    # Pattern: "today HH:MM"
+    match = re.match(r'today\s+(\d{1,2}):(\d{2})', text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    # Pattern: "tomorrow HH:MM"
+    match = re.match(r'tomorrow\s+(\d{1,2}):(\d{2})', text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        tomorrow = now + timedelta(days=1)
+        return tomorrow.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    # Pattern: "HH:MM" (today or tomorrow if past)
+    match = re.match(r'^(\d{1,2}):(\d{2})$', text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            result = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # If time is in the past, schedule for tomorrow
+            if result <= now:
+                result = result + timedelta(days=1)
+            return result
+
+    # Pattern: "YYYY-MM-DD HH:MM"
+    match = re.match(r'(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})', text)
+    if match:
+        try:
+            return datetime(
+                year=int(match.group(1)),
+                month=int(match.group(2)),
+                day=int(match.group(3)),
+                hour=int(match.group(4)),
+                minute=int(match.group(5))
+            )
+        except ValueError:
+            return None
+
+    return None
+
+
+async def _create_task_reminder(user_id: int, task_id: int,
+                                 reminder_time: datetime,
+                                 context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Create a task reminder via MCP."""
+    try:
+        client = get_task_tracker_client()
+        if client is None:
+            return False
+
+        reminder_time_iso = reminder_time.strftime("%Y-%m-%dT%H:%M:%S")
+        result = await client.create_task_reminder(
+            task_id=task_id,
+            user_id=str(user_id),
+            reminder_time=reminder_time_iso
+        )
+
+        if result.success:
+            logger.info(f"Created reminder for task {task_id} at {reminder_time_iso}")
+            return True
+        else:
+            logger.error(f"Failed to create reminder: {result.error}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error creating task reminder: {e}", exc_info=True)
+        return False
+
+
+async def _add_to_yandex_calendar(task_title: str,
+                                   task_description: str | None,
+                                   reminder_time: datetime | None) -> str:
+    """
+    Add task to Yandex Calendar if enabled.
+
+    Returns:
+        Status message for the user
+    """
+    if not is_calendar_enabled():
+        return ""
+
+    try:
+        result = await add_task_to_calendar(task_title, task_description, reminder_time)
+
+        if result.success:
+            logger.info(f"Added task to Yandex Calendar: {task_title}")
+            return "\nAdded to Yandex Calendar"
+        else:
+            logger.warning(f"Failed to add to calendar: {result.error}")
+            return ""
+
+    except Exception as e:
+        logger.error(f"Error adding to Yandex Calendar: {e}", exc_info=True)
+        return ""
+
+
+def _clear_pending_task(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear pending task data from context."""
+    context.user_data.pop("pending_task_id", None)
+    context.user_data.pop("pending_task_title", None)
+    context.user_data.pop("pending_task_description", None)
+
+
+async def _ask_calendar_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask if user wants to add task to Yandex Calendar."""
+    if not is_calendar_enabled():
+        # Calendar not configured, skip this step
+        if update.callback_query:
+            await update.callback_query.message.reply_text("Task setup complete!")
+        else:
+            await update.message.reply_text("Task setup complete!")
+        _clear_pending_task(context)
+        return ConversationHandler.END
+
+    keyboard = [
+        [
+            InlineKeyboardButton("Yes", callback_data=f"{CALENDAR_CALLBACK_PREFIX}yes"),
+            InlineKeyboardButton("No", callback_data=f"{CALENDAR_CALLBACK_PREFIX}no"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message_text = "Would you like to add this task to Yandex Calendar?"
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(message_text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(message_text, reply_markup=reply_markup)
+
+    return WAITING_FOR_CALENDAR_DECISION
+
+
+async def calendar_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the calendar decision (Yes/No)."""
+    query = update.callback_query
+    await query.answer()
+
+    callback_data = query.data
+
+    if not callback_data.startswith(CALENDAR_CALLBACK_PREFIX):
+        return WAITING_FOR_CALENDAR_DECISION
+
+    decision = callback_data[len(CALENDAR_CALLBACK_PREFIX):]
+
+    if decision == "no":
+        await query.edit_message_text("Task setup complete!")
+        _clear_pending_task(context)
+        return ConversationHandler.END
+
+    # User wants to add to calendar - ask for date/time
+    await query.edit_message_text(
+        "Enter date and time for the calendar event.\n\n"
+        "Supported formats:\n"
+        "• `today 14:30` — today at 14:30\n"
+        "• `tomorrow 9:00` — tomorrow at 9:00\n"
+        "• `2026-02-01 10:00` — specific date and time\n"
+        "• `14:30` — today (or tomorrow if past)\n\n"
+        "Or /cancel to skip.",
+        parse_mode="Markdown"
+    )
+    return WAITING_FOR_CALENDAR_DATETIME
+
+
+async def calendar_datetime_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parse calendar date/time input and add to Yandex Calendar."""
+    text = update.message.text.strip()
+    task_title = context.user_data.get("pending_task_title", "Task")
+    task_description = context.user_data.get("pending_task_description")
+
+    # Parse the time
+    calendar_time = parse_reminder_time(text)
+
+    if calendar_time is None:
+        await update.message.reply_text(
+            "Could not parse date/time. Please try again or /cancel.\n\n"
+            "Examples: `today 14:30`, `tomorrow 9:00`, `2026-02-01 10:00`",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_CALENDAR_DATETIME
+
+    # Add to Yandex Calendar
+    calendar_message = await _add_to_yandex_calendar(task_title, task_description, calendar_time)
+
+    time_str = calendar_time.strftime("%Y-%m-%d %H:%M")
+    if calendar_message:
+        message = f"Added to Yandex Calendar for **{time_str}**!\nTask setup complete!"
+    else:
+        message = f"Failed to add to calendar.\nTask setup complete!"
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+    _clear_pending_task(context)
+    return ConversationHandler.END
+
+
+async def task_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the task add conversation."""
+    _clear_pending_task(context)
+    await update.message.reply_text("Task setup cancelled.")
+    return ConversationHandler.END
+
+
+async def task_remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Set a reminder for an existing task.
+
+    Usage: /task_remind <task_id> <time>
+    Example: /task_remind 5 in 2 hours
+    """
+    user = update.effective_user
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/task_remind <task_id> <time>`\n\n"
+            "Examples:\n"
+            "• `/task_remind 5 in 2 hours`\n"
+            "• `/task_remind 3 tomorrow 9:00`\n"
+            "• `/task_remind 1 14:30`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Task ID must be a number.")
+        return
+
+    # Rest of args form the time
+    time_text = " ".join(context.args[1:])
+    reminder_time = parse_reminder_time(time_text)
+
+    if reminder_time is None:
+        await update.message.reply_text(
+            f"Could not parse time: `{time_text}`\n\n"
+            "Try formats like: `in 2 hours`, `tomorrow 9:00`, `14:30`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Verify task exists
+    client = get_task_tracker_client()
+    if client is None:
+        await update.message.reply_text("Task Tracker not initialized.")
+        return
+
+    task_result = await client.get_task(user_id=str(user.id), task_id=task_id)
+    if not task_result.success:
+        await update.message.reply_text(f"Task {task_id} not found.")
+        return
+
+    task_title = task_result.data.get("task", {}).get("title", "Task")
+
+    # Create reminder
+    reminder_time_iso = reminder_time.strftime("%Y-%m-%dT%H:%M:%S")
+    result = await client.create_task_reminder(
+        task_id=task_id,
+        user_id=str(user.id),
+        reminder_time=reminder_time_iso
+    )
+
+    if result.success:
+        time_str = reminder_time.strftime("%Y-%m-%d %H:%M")
+        message = f"Reminder set for **{time_str}**!\nTask: {task_title} (ID: {task_id})"
+
+        # Add to Yandex Calendar
+        calendar_message = await _add_to_yandex_calendar(task_title, None, reminder_time)
+        message += calendar_message
+
+        await update.message.reply_text(message, parse_mode="Markdown")
+        logger.info(f"User {user.id} set reminder for task {task_id} at {time_str}")
+    else:
+        await update.message.reply_text(f"Failed to set reminder: {result.error}")
+
+
+async def task_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик команды /task_list - показывает список открытых задач.
+
+    Calls the Task Tracker MCP Server to list open tasks.
+    """
+    user = update.effective_user
+    logger.info(f"User {user.id} requested task list")
+
+    # Show typing indicator
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    try:
+        client = get_task_tracker_client()
+        if client is None:
+            await update.message.reply_text(
+                "Task Tracker not initialized.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Call MCP tool to list open tasks
+        result = await client.list_open_tasks(user_id=str(user.id))
+
+        # Format and send response (plain text to avoid Markdown parsing issues)
+        response_text = format_tasks_for_telegram(result)
+        await update.message.reply_text(response_text)
+
+    except Exception as e:
+        logger.error(f"Error listing tasks for user {user.id}: {e}", exc_info=True)
+        await update.message.reply_text(f"Error: Failed to list tasks.\n{e}")
+
+
+async def task_done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик команды /task_done - завершает задачу.
+
+    Usage: /task_done <task_id>
+    """
+    user = update.effective_user
+    logger.info(f"User {user.id} completing a task")
+
+    # Parse arguments
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/task_done <task_id>`\n\n"
+            "Use `/task_list` to see task IDs.",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "Task ID must be a number.\n"
+            "Use `/task_list` to see task IDs.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Show typing indicator
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    try:
+        client = get_task_tracker_client()
+        if client is None:
+            await update.message.reply_text(
+                "Task Tracker not initialized.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Get task title first (for calendar deletion)
+        task_title = None
+        task_info = await client.get_task(user_id=str(user.id), task_id=task_id)
+        if task_info.success and task_info.data:
+            task_data = task_info.data.get("task", {})
+            task_title = task_data.get("title")
+
+        # Call MCP tool to complete task
+        result = await client.complete_task(user_id=str(user.id), task_id=task_id)
+
+        if result.success and result.data:
+            message = f"Task completed: **{task_title or task_id}**"
+
+            # Delete from Yandex Calendar if enabled (with timeout)
+            if is_calendar_enabled() and task_title:
+                try:
+                    calendar_result = await asyncio.wait_for(
+                        delete_task_from_calendar(task_title),
+                        timeout=10.0
+                    )
+                    if calendar_result.success:
+                        message += "\nRemoved from Yandex Calendar"
+                        logger.info(f"Deleted task from calendar: {task_title}")
+                    else:
+                        logger.warning(f"Calendar delete failed: {calendar_result.error}")
+                except asyncio.TimeoutError:
+                    logger.warning(f"Calendar delete timed out for: {task_title}")
+                except Exception as cal_err:
+                    logger.warning(f"Calendar delete error: {cal_err}")
+
+            await update.message.reply_text(message, parse_mode="Markdown")
+            logger.info(f"User {user.id} completed task {task_id}")
+        else:
+            await update.message.reply_text(
+                f"*Error:* {result.error}",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error(f"Error completing task for user {user.id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"*Error:* Failed to complete task.\n{e}",
+            parse_mode="Markdown"
+        )
+
+
+async def task_tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик команды /task_tools - показывает доступные инструменты Task Tracker.
+
+    Queries the Task Tracker MCP Server for available tools.
+    """
+    user = update.effective_user
+    logger.info(f"User {user.id} requested Task Tracker tools list")
+
+    # Show typing indicator
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    try:
+        tools = await get_task_tracker_tools()
+
+        if not tools:
+            await update.message.reply_text(
+                "No Task Tracker tools available.",
+                parse_mode="Markdown"
+            )
+            return
+
+        lines = ["*Task Tracker MCP Tools:*\n"]
+        for i, tool in enumerate(tools, 1):
+            name = tool.name.replace("_", "\\_")
+            description = tool.description.replace("_", "\\_")
+            lines.append(f"{i}. `{name}`")
+            lines.append(f"   {description}\n")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        logger.info(f"User {user.id} received {len(tools)} Task Tracker tools")
+
+    except Exception as e:
+        logger.error(f"Error fetching Task Tracker tools for user {user.id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"*Error:* Failed to fetch Task Tracker tools.\n{e}",
+            parse_mode="Markdown"
+        )
+
+
+# =============================================================================
+# Reminder Commands (MCP + Scheduler)
+# =============================================================================
+
+async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик команды /reminder - управление напоминаниями.
+
+    Usage:
+        /reminder on       - Enable daily reminders
+        /reminder off      - Disable reminders
+        /reminder now      - Get summary immediately
+        /reminder status   - Show reminder status
+        /reminder set HH:MM - Set reminder time
+        /reminder email    - Configure email notifications
+    """
+    user = update.effective_user
+    args = context.args
+
+    logger.info(f"User {user.id} called /reminder with args: {args}")
+
+    # Show typing indicator
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    # Get MCP client (HTTP or stdio based on config)
+    if USE_HTTP_MCP:
+        mcp = get_mcp_http_client()
+        if mcp is None:
+            await update.message.reply_text(
+                "*Error:* MCP client not initialized.",
+                parse_mode="Markdown"
+            )
+            return
+    else:
+        # For local development, use stdio client
+        mcp = get_task_tracker_client()
+        if mcp is None:
+            await update.message.reply_text(
+                "*Error:* Task Tracker client not initialized.",
+                parse_mode="Markdown"
+            )
+            return
+
+    user_id = str(user.id)
+
+    # No arguments - show help
+    if not args:
+        await update.message.reply_text(
+            "**Напоминания о задачах**\n\n"
+            "Команды:\n"
+            "• `/reminder on` — включить ежедневные напоминания\n"
+            "• `/reminder off` — выключить напоминания\n"
+            "• `/reminder now` — получить сводку сейчас\n"
+            "• `/reminder status` — статус напоминаний\n"
+            "• `/reminder set HH:MM` — установить время (напр. 09:00)\n"
+            "• `/reminder_email` — настроить email уведомления",
+            parse_mode="Markdown"
+        )
+        return
+
+    subcommand = args[0].lower()
+
+    try:
+        if subcommand == "on":
+            # Enable reminders, preserving existing time or using default (9:00)
+            # First get current preferences to preserve the time
+            if USE_HTTP_MCP:
+                prefs_result = await mcp.get_reminder_preferences(user_id)
+            else:
+                prefs_result = await mcp.call_tool("reminder_get_preferences", {
+                    "user_id": user_id
+                })
+
+            # Get existing time or use defaults
+            hour = 9
+            minute = 0
+            if prefs_result.success and prefs_result.data:
+                hour = prefs_result.data.get("schedule_hour", 9)
+                minute = prefs_result.data.get("schedule_minute", 0)
+
+            if USE_HTTP_MCP:
+                result = await mcp.set_reminder_preferences(user_id, enabled=True, hour=hour, minute=minute)
+            else:
+                result = await mcp.call_tool("reminder_set_preferences", {
+                    "user_id": user_id, "enabled": True, "hour": hour, "minute": minute
+                })
+
+            if result.success:
+                time_str = f"{hour:02d}:{minute:02d}"
+                await update.message.reply_text(
+                    "Напоминания **включены**.\n\n"
+                    f"Вы будете получать сводку задач каждый день в **{time_str}**.\n"
+                    "Используйте `/reminder set HH:MM` для изменения времени.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    f"*Ошибка:* {result.error}",
+                    parse_mode="Markdown"
+                )
+
+        elif subcommand == "off":
+            # Disable reminders
+            if USE_HTTP_MCP:
+                result = await mcp.set_reminder_preferences(user_id, enabled=False)
+            else:
+                result = await mcp.call_tool("reminder_set_preferences", {
+                    "user_id": user_id, "enabled": False
+                })
+
+            if result.success:
+                await update.message.reply_text(
+                    "Напоминания **выключены**.\n"
+                    "Используйте `/reminder on` чтобы включить снова.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    f"*Ошибка:* {result.error}",
+                    parse_mode="Markdown"
+                )
+
+        elif subcommand == "now":
+            # Generate and send summary immediately
+            if USE_HTTP_MCP:
+                result = await mcp.generate_summary(user_id, include_completed=True)
+            else:
+                result = await mcp.call_tool("reminder_generate_summary", {
+                    "user_id": user_id, "include_completed": True
+                })
+
+            if result.success and result.data:
+                summary = result.data.get("summary", "Нет данных")
+                await update.message.reply_text(summary)
+            else:
+                await update.message.reply_text(
+                    f"*Ошибка:* {result.error}",
+                    parse_mode="Markdown"
+                )
+
+        elif subcommand == "status":
+            # Show reminder status
+            if USE_HTTP_MCP:
+                result = await mcp.get_reminder_preferences(user_id)
+                email_result = await mcp.get_email_preferences(user_id)
+            else:
+                result = await mcp.call_tool("reminder_get_preferences", {
+                    "user_id": user_id
+                })
+                email_result = await mcp.call_tool("notification_get_email_preferences", {
+                    "user_id": user_id
+                })
+
+            if result.success and result.data:
+                prefs = result.data
+                enabled = prefs.get("enabled", False)
+                hour = prefs.get("schedule_hour", 9)
+                minute = prefs.get("schedule_minute", 0)
+                last = prefs.get("last_reminder")
+
+                status = "включены" if enabled else "выключены"
+                time_str = f"{hour:02d}:{minute:02d}"
+                last_str = last if last else "никогда"
+
+                # Get email status
+                email_status = "выключены"
+                email_addr = ""
+                if email_result.success and email_result.data:
+                    email_enabled = email_result.data.get("email_enabled", False)
+                    email_recipient = email_result.data.get("email_recipient")
+                    if email_enabled and email_recipient:
+                        email_status = "включены"
+                        email_addr = f"\n• Email: `{email_recipient}`"
+
+                await update.message.reply_text(
+                    f"**Статус напоминаний**\n\n"
+                    f"• Статус: **{status}**\n"
+                    f"• Время: **{time_str}**\n"
+                    f"• Последнее: {last_str}\n"
+                    f"• Email уведомления: **{email_status}**{email_addr}",
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    f"*Ошибка:* {result.error}",
+                    parse_mode="Markdown"
+                )
+
+        elif subcommand == "set":
+            # Set reminder time
+            if len(args) < 2:
+                await update.message.reply_text(
+                    "Укажите время в формате HH:MM\n"
+                    "Например: `/reminder set 09:00`",
+                    parse_mode="Markdown"
+                )
+                return
+
+            time_str = args[1]
+            try:
+                parts = time_str.split(":")
+                hour = int(parts[0])
+                minute = int(parts[1]) if len(parts) > 1 else 0
+
+                if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                    raise ValueError("Invalid time")
+
+            except (ValueError, IndexError):
+                await update.message.reply_text(
+                    "Неверный формат времени.\n"
+                    "Используйте HH:MM, например: `09:00` или `21:30`",
+                    parse_mode="Markdown"
+                )
+                return
+
+            if USE_HTTP_MCP:
+                result = await mcp.set_reminder_preferences(
+                    user_id, enabled=True, hour=hour, minute=minute
+                )
+            else:
+                result = await mcp.call_tool("reminder_set_preferences", {
+                    "user_id": user_id, "enabled": True, "hour": hour, "minute": minute
+                })
+
+            if result.success:
+                await update.message.reply_text(
+                    f"Напоминания установлены на **{hour:02d}:{minute:02d}**.\n"
+                    "Вы будете получать сводку задач каждый день в это время.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    f"*Ошибка:* {result.error}",
+                    parse_mode="Markdown"
+                )
+
+        else:
+            await update.message.reply_text(
+                f"Неизвестная команда: `{subcommand}`\n"
+                "Используйте `/reminder` для справки.",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error(f"Error in reminder command for user {user.id}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"*Ошибка:* {e}",
+            parse_mode="Markdown"
+        )
+
+
+# =============================================================================
+# Email Notification Flow Handlers
+# =============================================================================
+
+async def reminder_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Start the email notification setup flow.
+
+    Usage: /reminder_email
+    """
+    user = update.effective_user
+    user_id = str(user.id)
+
+    logger.info(f"User {user_id} starting email notification setup")
+
+    # Check current email preferences
+    if USE_HTTP_MCP:
+        mcp = get_mcp_http_client()
+        if mcp:
+            result = await mcp.get_email_preferences(user_id)
+            if result.success and result.data:
+                current_email = result.data.get("email_recipient")
+                email_enabled = result.data.get("email_enabled", False)
+                if email_enabled and current_email:
+                    context.user_data["current_email"] = current_email
+
+    keyboard = [
+        [
+            InlineKeyboardButton("Yes", callback_data=f"{EMAIL_CALLBACK_PREFIX}yes"),
+            InlineKeyboardButton("No", callback_data=f"{EMAIL_CALLBACK_PREFIX}no"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    current_email = context.user_data.get("current_email")
+    if current_email:
+        message = (
+            f"**Email Notification Setup**\n\n"
+            f"Current email: `{current_email}`\n\n"
+            "Would you like to update your email notification settings?"
+        )
+    else:
+        message = (
+            "**Email Notification Setup**\n\n"
+            "Would you like to receive reminder notifications via email?\n\n"
+            "When enabled, you'll receive an email copy of your task reminders."
+        )
+
+    await update.message.reply_text(
+        message,
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+    return WAITING_FOR_EMAIL_DECISION
+
+
+async def email_decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the email notification decision (Yes/No)."""
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    user_id = str(user.id)
+    callback_data = query.data
+
+    if not callback_data.startswith(EMAIL_CALLBACK_PREFIX):
+        return WAITING_FOR_EMAIL_DECISION
+
+    decision = callback_data[len(EMAIL_CALLBACK_PREFIX):]
+
+    if decision == "no":
+        # Disable email notifications
+        if USE_HTTP_MCP:
+            mcp = get_mcp_http_client()
+            if mcp:
+                await mcp.set_email_preferences(user_id, email_enabled=False)
+
+        await query.edit_message_text(
+            "Email notifications **disabled**.\n\n"
+            "Use `/reminder_email` to enable them later.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+    # User wants to enable email - ask for address
+    await query.edit_message_text(
+        "Please enter your email address:\n\n"
+        "_Example: user@example.com_\n\n"
+        "Or /cancel to abort.",
+        parse_mode="Markdown"
+    )
+
+    return WAITING_FOR_EMAIL_ADDRESS
+
+
+async def email_address_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the email address input."""
+    user = update.effective_user
+    user_id = str(user.id)
+    email = update.message.text.strip()
+
+    # Validate email format
+    email_regex = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+    if not email_regex.match(email):
+        await update.message.reply_text(
+            "Invalid email format. Please enter a valid email address:\n\n"
+            "_Example: user@example.com_\n\n"
+            "Or /cancel to abort.",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_EMAIL_ADDRESS
+
+    # Save email preferences via MCP
+    if USE_HTTP_MCP:
+        mcp = get_mcp_http_client()
+        if mcp:
+            result = await mcp.set_email_preferences(user_id, email_enabled=True, email_recipient=email)
+            if not result.success:
+                await update.message.reply_text(
+                    f"*Error:* {result.error}",
+                    parse_mode="Markdown"
+                )
+                return ConversationHandler.END
+    else:
+        # For stdio mode
+        client = get_task_tracker_client()
+        if client:
+            await client.call_tool("notification_set_email_preferences", {
+                "user_id": user_id,
+                "email_enabled": True,
+                "email_recipient": email
+            })
+
+    await update.message.reply_text(
+        f"Email notifications **enabled**!\n\n"
+        f"Email: `{email}`\n\n"
+        "You will receive an email copy of your task reminders.\n"
+        "Use `/reminder_email` to change settings.",
+        parse_mode="Markdown"
+    )
+
+    logger.info(f"User {user_id} enabled email notifications: {email}")
+    return ConversationHandler.END
+
+
+async def email_setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the email setup flow."""
+    await update.message.reply_text(
+        "Email setup cancelled.",
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+
+async def send_telegram_message(user_id: str, message: str) -> bool:
+    """
+    Send a Telegram message to a user.
+
+    This is the callback function used by the scheduler.
+
+    Args:
+        user_id: Telegram user ID
+        message: Message text to send
+
+    Returns:
+        True if sent successfully, False otherwise
+    """
+    global telegram_app
+
+    if telegram_app is None:
+        logger.error("Telegram app not initialized")
+        return False
+
+    try:
+        await telegram_app.bot.send_message(
+            chat_id=int(user_id),
+            text=message,
+            parse_mode=None  # Plain text for summaries
+        )
+        logger.info(f"Sent scheduled reminder to user {user_id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to send message to user {user_id}: {e}")
+        return False
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик текстовых сообщений"""
+    user = update.effective_user
+    user_message = update.message.text
+
+    logger.info(f"Сообщение от {user.id} ({user.username}): {user_message[:50]}...")
+
+    # Получаем модель пользователя
+    model_id, was_fallback = get_user_model_for_request(user.id)
+
+    # Если модель изменилась (была недоступна), уведомляем пользователя
+    fallback_notice = ""
+    if was_fallback:
+        stored = get_user_model(user.id)
+        if stored is not None:
+            # Обновляем в базе на дефолтную
+            set_user_model(user.id, model_id)
+            fallback_notice = (
+                f"_Ваша модель `{stored}` недоступна. "
+                f"Использую `{model_id}`._\n\n"
+            )
+
+    # Показываем индикатор "печатает..."
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING
+    )
+
+    try:
+        # Check if using external memory
+        memory = get_external_memory()
+        use_external = memory.is_enabled(user.id)
+
+        if use_external:
+            # Store message in external memory
+            memory.add_message(user.id, "user", user_message)
+
+            # Build context using memory retrieval
+            retrieval = get_memory_retrieval()
+            messages_for_api = retrieval.build_messages_for_api(
+                user_id=user.id,
+                system_prompt=SYSTEM_PROMPT,
+                current_message=user_message,
+                include_search=True
+            )
+        else:
+            # Legacy mode: use conversation store
+            store = get_conversation_store()
+            store.add_message(user.id, "user", user_message)
+
+            state = store.get_conversation_state(user.id)
+            messages_for_api = state.get_context_for_openai(SYSTEM_PROMPT)
+
+        # Полный текст запроса для подсчёта токенов
+        full_input_text = "\n".join(
+            f"{m['role']}: {m['content']}" for m in messages_for_api
+        )
+
+        # Запрос к OpenAI API с контекстом разговора
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=messages_for_api,
+            max_tokens=2000,
+            temperature=0.7
+        )
+
+        assistant_message = response.choices[0].message.content
+        logger.info(f"Ответ для {user.id} (модель {model_id}): {assistant_message[:50]}...")
+
+        # Store assistant response
+        if use_external:
+            memory.add_message(user.id, "assistant", assistant_message)
+        else:
+            store = get_conversation_store()
+            store.add_message(user.id, "assistant", assistant_message)
+
+        # Отправляем ответ с Markdown
+        full_response = fallback_notice + assistant_message
+        await update.message.reply_text(
+            full_response,
+            parse_mode="Markdown"
+        )
+
+        # Проверяем, нужно ли показывать отчёт о токенах
+        if get_user_show_tokens(user.id):
+            # Получаем отчёт об использовании токенов
+            usage_report = get_usage_report(
+                response=response,
+                input_text=full_input_text,
+                output_text=assistant_message,
+                model_id=model_id
+            )
+            # Форматируем и отправляем отчёт как второе сообщение
+            report_text = format_usage_report(usage_report)
+            await update.message.reply_text(
+                report_text,
+                parse_mode="Markdown"
+            )
+            logger.info(
+                f"Токены для {user.id}: input={usage_report.usage.input_tokens}, "
+                f"output={usage_report.usage.output_tokens}, "
+                f"cost=${usage_report.cost.total_cost:.6f}"
+            )
+
+        # Проверяем, нужно ли сжимать диалог (после ответа)
+        if await summary_manager.summarize_if_needed(user.id):
+            logger.info(f"Auto-summarization triggered for user {user.id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке сообщения (модель {model_id}): {e}")
+        await update.message.reply_text(
+            "Произошла ошибка при обработке запроса. "
+            "Пожалуйста, попробуйте позже или переформулируйте вопрос."
+        )
+
+
+def main() -> None:
+    """Запуск бота"""
+    global summary_manager, telegram_app
+
+    # Инициализируем базы данных
+    init_database()
+    init_conversation_store()
+    init_external_memory()
+    init_memory_retrieval()
+
+    # Инициализируем менеджер сводок
+    summary_manager = SummaryManager(openai_client=client)
+
+    # Инициализируем MCP клиент для Perplexity
+    if api_token_perplexity:
+        init_mcp_client(api_token_perplexity)
+        logger.info("Perplexity MCP client initialized")
+    else:
+        logger.warning("PERPLEXITY_API_KEY not set - /mcp_tools command will not work")
+
+    # Инициализируем MCP клиент
+    if USE_HTTP_MCP:
+        # HTTP client for Kubernetes deployment
+        init_mcp_http_client(MCP_SERVER_URL)
+        logger.info(f"MCP HTTP client initialized: {MCP_SERVER_URL}")
+    else:
+        # Stdio client for local development
+        init_task_tracker_client()
+        logger.info("Task Tracker MCP client (stdio) initialized")
+
+    # Инициализируем Yandex Calendar (опционально)
+    if yandex_calendar_username and yandex_calendar_password:
+        if init_yandex_calendar(yandex_calendar_username, yandex_calendar_password):
+            logger.info("Yandex Calendar integration enabled")
+        else:
+            logger.warning("Yandex Calendar initialization failed")
+    else:
+        logger.info("Yandex Calendar not configured (optional)")
+
+    # Создаём приложение
+    application = Application.builder().token(api_token_telegram).build()
+    telegram_app = application
+
+    # Инициализируем планировщик напоминаний (запустится в post_init)
+    scheduler = init_scheduler(send_telegram_message)
+
+    async def post_init(app: Application) -> None:
+        """Start scheduler after event loop is running."""
+        scheduler.start()
+        logger.info("Reminder scheduler started")
+
+    async def post_shutdown(app: Application) -> None:
+        """Stop scheduler on shutdown."""
+        scheduler.stop()
+        if USE_HTTP_MCP:
+            await close_mcp_http_client()
+        logger.info("Cleanup completed")
+
+    application.post_init = post_init
+    application.post_shutdown = post_shutdown
+
+    # Регистрируем обработчики команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("set_model", set_model_command))
+    application.add_handler(CommandHandler("current_model", current_model_command))
+    application.add_handler(CommandHandler("tokens", tokens_command))
+    application.add_handler(CommandHandler("show_commands", show_commands))
+
+    # Обработчик настройки внешней памяти (ConversationHandler для интерактивного потока)
+    summary_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("summary", summary_command)],
+        states={
+            WAITING_FOR_STORAGE_TYPE: [
+                CallbackQueryHandler(
+                    storage_type_callback,
+                    pattern=f"^{STORAGE_CALLBACK_PREFIX}"
+                )
+            ],
+            WAITING_FOR_THRESHOLD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, summary_threshold_received)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", summary_cancel)],
+        per_message=False,
+    )
+    application.add_handler(summary_conv_handler)
+
+    # Дополнительные команды для внешней памяти
+    application.add_handler(CommandHandler("summary_status", summary_status_command))
+    application.add_handler(CommandHandler("summary_off", summary_off_command))
+    application.add_handler(CommandHandler("summary_on", summary_on_command))
+    application.add_handler(CommandHandler("summary_now", summary_now_command))
+    application.add_handler(CommandHandler("clear_history", clear_history_command))
+
+    # Обработчик команды /mcp_tools для просмотра MCP инструментов
+    application.add_handler(CommandHandler("mcp_tools", mcp_tools_command))
+
+    # Обработчики команд Task Tracker (MCP)
+    application.add_handler(CommandHandler("tasks", tasks_command))
+
+    # Enhanced task_add with conversation flow for sublist + reminder + calendar
+    task_add_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("task_add", task_add_command)],
+        states={
+            WAITING_FOR_SUBLIST_DECISION: [
+                CallbackQueryHandler(
+                    sublist_decision_callback,
+                    pattern=f"^{SUBLIST_CALLBACK_PREFIX}"
+                )
+            ],
+            WAITING_FOR_REMINDER_DECISION: [
+                CallbackQueryHandler(
+                    reminder_decision_callback,
+                    pattern=f"^{REMINDER_CALLBACK_PREFIX}"
+                )
+            ],
+            WAITING_FOR_CUSTOM_REMINDER_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, custom_reminder_time_received)
+            ],
+            WAITING_FOR_CALENDAR_DECISION: [
+                CallbackQueryHandler(
+                    calendar_decision_callback,
+                    pattern=f"^{CALENDAR_CALLBACK_PREFIX}"
+                )
+            ],
+            WAITING_FOR_CALENDAR_DATETIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, calendar_datetime_received)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", task_add_cancel)],
+        per_message=False,
+    )
+    application.add_handler(task_add_conv_handler)
+
+    application.add_handler(CommandHandler("task_list", task_list_command))
+    application.add_handler(CommandHandler("task_done", task_done_command))
+    application.add_handler(CommandHandler("task_tools", task_tools_command))
+    application.add_handler(CommandHandler("task_remind", task_remind_command))
+
+    # Обработчик команды напоминаний
+    application.add_handler(CommandHandler("reminder", reminder_command))
+
+    # Email notification setup flow
+    email_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("reminder_email", reminder_email_command)],
+        states={
+            WAITING_FOR_EMAIL_DECISION: [
+                CallbackQueryHandler(
+                    email_decision_callback,
+                    pattern=f"^{EMAIL_CALLBACK_PREFIX}"
+                )
+            ],
+            WAITING_FOR_EMAIL_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, email_address_received)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", email_setup_cancel)],
+        per_message=False,
+    )
+    application.add_handler(email_conv_handler)
+
+    # Регистрируем обработчик callback-кнопок для выбора модели
+    application.add_handler(
+        CallbackQueryHandler(model_selection_callback, pattern=f"^{MODEL_CALLBACK_PREFIX}")
+    )
+
+    # Регистрируем обработчик сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Запускаем бота
+    logger.info("Бот запущен...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

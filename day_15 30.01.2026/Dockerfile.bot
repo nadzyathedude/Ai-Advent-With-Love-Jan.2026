@@ -1,0 +1,46 @@
+# Telegram Bot Dockerfile
+# Kubernetes-ready bot with MCP client and scheduler
+
+FROM python:3.12-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY bot.py .
+COPY models.py .
+COPY storage.py .
+COPY token_usage.py .
+COPY conversation_store.py .
+COPY external_memory.py .
+COPY memory_retrieval.py .
+COPY summary_manager.py .
+COPY mcp_client.py .
+COPY task_tracker_client.py .
+COPY task_tracker_server.py .
+COPY mcp_http_client.py .
+COPY scheduler.py .
+
+# Create data directory
+RUN mkdir -p /data
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV DATA_DIR=/data
+# MCP server URL will be set via Kubernetes ConfigMap/Secret
+ENV USE_HTTP_MCP=true
+ENV MCP_SERVER_URL=http://mcp-server:8080
+
+# Run the bot
+CMD ["python", "bot.py"]
