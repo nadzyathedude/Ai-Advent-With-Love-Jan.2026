@@ -13,6 +13,7 @@ Email-уведомления через MCP
 - При срабатывании напоминания отправляется email через Yandex Mail SMTP
 
 **Результат:** Email-уведомления о задачах через MCP Tool `notification_send_email`
+https://monosnap.ai/file/nZReiB9apg13TkilB5PNhBH5Yls7hV
 
 ---
 
