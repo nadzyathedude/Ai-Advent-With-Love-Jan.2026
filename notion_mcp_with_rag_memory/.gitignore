@@ -1,9 +1,11 @@
 .venv/
+venv/
 __pycache__/
 *.pyc
 
 # Generated index files
-notion_index.json
-notion_sync_state.json
-test_notion_index.json
-test_sync_state.json
+*.json
+!package.json
+
+# Claude settings
+.claude/
