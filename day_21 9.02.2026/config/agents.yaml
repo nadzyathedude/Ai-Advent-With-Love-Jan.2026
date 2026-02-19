@@ -1,0 +1,5 @@
+agents:
+  project_helper:
+    permissions:
+      - "docs:read"
+      - "git:read"

@@ -1,0 +1,12 @@
+{
+  "id": "git_context",
+  "version": "1.0.0",
+  "entrypoint": "tool_git_branch",
+  "tools": [
+    {
+      "name": "git.current_branch",
+      "class": "GitBranchTool",
+      "permissions": ["git:read"]
+    }
+  ]
+}

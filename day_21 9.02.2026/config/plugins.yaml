@@ -1,0 +1,5 @@
+plugins:
+  docs_rag:
+    enabled: true
+  git_context:
+    enabled: true
