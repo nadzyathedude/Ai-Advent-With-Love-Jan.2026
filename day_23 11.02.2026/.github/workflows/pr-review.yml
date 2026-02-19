@@ -1,0 +1,67 @@
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download learning DB (if exists)
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: review-memory-db
+          path: .
+          if_no_artifact_found: warn
+        continue-on-error: true
+
+      - name: Run PR review
+        id: review
+        env:
+          REVIEW_MEMORY_DB: review_memory.db
+        run: |
+          REPORT=$(python -m core.cli.main review \
+            --base ${{ github.event.pull_request.base.ref }} \
+            --pr-id "${{ github.repository }}#${{ github.event.pull_request.number }}")
+          echo "$REPORT" > review_report.md
+
+      - name: Upload learning DB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-memory-db
+          path: review_memory.db
+          retention-days: 90
+          overwrite: true
+        if: always()
+
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('review_report.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report,
+            });

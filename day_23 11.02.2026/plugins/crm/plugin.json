@@ -1,0 +1,10 @@
+{
+  "id": "crm",
+  "version": "1.0.0",
+  "entrypoint": "tool_crm",
+  "tools": [
+    {"name": "crm.get_user_tickets", "class": "GetUserTicketsTool", "permissions": ["crm:read"]},
+    {"name": "crm.get_ticket_details", "class": "GetTicketDetailsTool", "permissions": ["crm:read"]},
+    {"name": "crm.search_similar_issues", "class": "SearchSimilarIssuesTool", "permissions": ["crm:read"]}
+  ]
+}

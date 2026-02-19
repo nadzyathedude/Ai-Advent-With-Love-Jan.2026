@@ -1,0 +1,33 @@
+agents:
+  project_helper:
+    permissions:
+      - "docs:read"
+      - "git:read"
+  bug_reviewer:
+    permissions:
+      - "pr:read"
+  style_reviewer:
+    permissions:
+      - "pr:read"
+      - "docs:read"
+  security_reviewer:
+    permissions:
+      - "pr:read"
+  performance_reviewer:
+    permissions:
+      - "pr:read"
+  learning_reviewer:
+    permissions:
+      - "review_memory:read"
+  review_orchestrator:
+    permissions:
+      - "pr:read"
+      - "docs:read"
+      - "review_memory:read"
+      - "review_memory:write"
+  support_agent:
+    permissions:
+      - "docs:read"
+      - "crm:read"
+      - "support_memory:read"
+      - "support_memory:write"

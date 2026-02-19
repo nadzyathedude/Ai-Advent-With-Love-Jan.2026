@@ -1,0 +1,13 @@
+plugins:
+  docs_rag:
+    enabled: true
+  git_context:
+    enabled: true
+  pr_context:
+    enabled: true
+  review_memory:
+    enabled: true
+  crm:
+    enabled: true
+  support_memory:
+    enabled: true
