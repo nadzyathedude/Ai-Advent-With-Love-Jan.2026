@@ -1,0 +1,12 @@
+{
+  "id": "docs_rag",
+  "version": "1.0.0",
+  "entrypoint": "tool_docs_search",
+  "tools": [
+    {
+      "name": "docs.search_project_docs",
+      "class": "DocsSearchTool",
+      "permissions": ["docs:read"]
+    }
+  ]
+}
