@@ -128,6 +128,34 @@ def cmd_support_clear(args):
     print(f"Deleted {count} interaction(s) for user {args.user_id}")
 
 
+def cmd_list_agents(args):
+    """Handle the 'list-agents' subcommand."""
+    import yaml
+
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "config",
+        "agents.yaml",
+    )
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        print("Error: config/agents.yaml not found.", file=sys.stderr)
+        sys.exit(1)
+
+    agents = config.get("agents", {})
+    if not agents:
+        print("No agents configured.")
+        return
+
+    print(f"{'Agent':<25s} Permissions")
+    print(f"{'─' * 25} {'─' * 40}")
+    for name, info in agents.items():
+        perms = ", ".join(info.get("permissions", []))
+        print(f"  {name:<23s} {perms}")
+
+
 def cmd_list_plugins(args):
     """Handle the 'list-plugins' subcommand."""
     loader = PluginLoader()
@@ -223,6 +251,10 @@ def main():
     sc_parser = subparsers.add_parser("support-clear", help="Delete user support interaction history")
     sc_parser.add_argument("--user-id", type=int, required=True, help="CRM user ID")
     sc_parser.set_defaults(func=cmd_support_clear)
+
+    # list-agents
+    la_parser = subparsers.add_parser("list-agents", help="List all configured agents and their permissions")
+    la_parser.set_defaults(func=cmd_list_agents)
 
     # list-tools
     lt_parser = subparsers.add_parser("list-tools", help="List all registered tools")
