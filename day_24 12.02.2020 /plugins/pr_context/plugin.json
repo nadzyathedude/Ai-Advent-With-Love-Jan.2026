@@ -1,0 +1,17 @@
+{
+  "id": "pr_context",
+  "version": "1.0.0",
+  "entrypoint": "tool_pr",
+  "tools": [
+    {
+      "name": "pr.get_diff",
+      "class": "PRGetDiffTool",
+      "permissions": ["pr:read"]
+    },
+    {
+      "name": "pr.get_file_content",
+      "class": "PRGetFileContentTool",
+      "permissions": ["pr:read"]
+    }
+  ]
+}

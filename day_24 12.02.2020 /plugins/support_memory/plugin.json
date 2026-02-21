@@ -1,0 +1,10 @@
+{
+  "id": "support_memory",
+  "version": "1.0.0",
+  "entrypoint": "tool_support_memory",
+  "tools": [
+    {"name": "support_memory.store_interaction", "class": "StoreInteractionTool", "permissions": ["support_memory:write"]},
+    {"name": "support_memory.get_user_history", "class": "GetUserHistoryTool", "permissions": ["support_memory:read"]},
+    {"name": "support_memory.search_past_issues", "class": "SearchPastIssuesTool", "permissions": ["support_memory:read"]}
+  ]
+}

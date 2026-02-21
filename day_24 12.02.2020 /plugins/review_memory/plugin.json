@@ -1,0 +1,27 @@
+{
+  "id": "review_memory",
+  "version": "1.0.0",
+  "entrypoint": "tool_review_memory",
+  "tools": [
+    {
+      "name": "review_memory.store_review_run",
+      "class": "StoreReviewRunTool",
+      "permissions": ["review_memory:write"]
+    },
+    {
+      "name": "review_memory.search_similar_findings",
+      "class": "SearchSimilarFindingsTool",
+      "permissions": ["review_memory:read"]
+    },
+    {
+      "name": "review_memory.record_feedback",
+      "class": "RecordFeedbackTool",
+      "permissions": ["review_memory:write"]
+    },
+    {
+      "name": "review_memory.get_project_conventions",
+      "class": "GetProjectConventionsTool",
+      "permissions": ["review_memory:read"]
+    }
+  ]
+}

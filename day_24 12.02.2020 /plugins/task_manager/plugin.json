@@ -1,0 +1,12 @@
+{
+  "id": "task_manager",
+  "version": "1.0.0",
+  "entrypoint": "tool_task",
+  "tools": [
+    {"name": "task.create", "class": "CreateTaskTool", "permissions": ["task:write"]},
+    {"name": "task.list", "class": "ListTasksTool", "permissions": ["task:read"]},
+    {"name": "task.update", "class": "UpdateTaskTool", "permissions": ["task:write"]},
+    {"name": "task.get", "class": "GetTaskTool", "permissions": ["task:read"]},
+    {"name": "task.project_status", "class": "ProjectStatusTool", "permissions": ["task:read"]}
+  ]
+}

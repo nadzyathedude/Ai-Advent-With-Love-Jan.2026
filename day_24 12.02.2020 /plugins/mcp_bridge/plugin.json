@@ -1,0 +1,9 @@
+{
+  "id": "mcp_bridge",
+  "version": "1.0.0",
+  "entrypoint": "tool_mcp",
+  "tools": [
+    {"name": "mcp.call_service", "class": "CallServiceTool", "permissions": ["mcp:read"]},
+    {"name": "mcp.list_services", "class": "ListServicesTool", "permissions": ["mcp:read"]}
+  ]
+}
